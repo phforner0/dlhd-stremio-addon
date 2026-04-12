@@ -232,7 +232,7 @@ def _is_playlist_response(url: str, content_type: str | None) -> bool:
 
 def _stream_upstream(upstream, session):
     try:
-        for chunk in upstream.iter_content(chunk_size=64 * 1024):
+        for chunk in upstream.iter_content(chunk_size=256 * 1024):
             if chunk:
                 yield chunk
     finally:
@@ -265,14 +265,30 @@ def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[di
     def factory() -> list[dict]:
         try:
             wrapper = get_wrapper(channel.channel_id)
-            resolutions = resolver.resolve_wrapper(wrapper, resolve_all=True)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Channel stream resolution failed for %s: %s", channel.channel_id, exc)
             return []
 
+        targets: list[tuple[str, str]] = []
+        if wrapper.player.primary.url:
+            targets.append((wrapper.player.primary.label, wrapper.player.primary.url))
+        for alternate in wrapper.player.alternates:
+            targets.append((alternate.label or "alternate", alternate.url))
+
         streams: list[dict] = []
         seen_urls: set[str] = set()
-        for resolution in resolutions:
+        for label, player_url in targets[:settings.CHANNEL_STREAM_MAX_ATTEMPTS]:
+            try:
+                resolution = resolver.resolve_player(label, player_url)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "Channel player resolution failed for %s (%s): %s",
+                    channel.channel_id,
+                    player_url,
+                    exc,
+                )
+                continue
+
             for manifest in resolution.manifests:
                 if manifest.url in seen_urls:
                     continue
@@ -287,6 +303,12 @@ def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[di
                         player_type=manifest.player_type,
                     )
                 )
+                if len(streams) >= settings.CHANNEL_STREAM_MAX_RESULTS:
+                    return streams
+
+            if streams:
+                return streams
+
         return streams
 
     return _remember_streams(

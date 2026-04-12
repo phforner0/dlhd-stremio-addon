@@ -181,6 +181,10 @@ The service exposes a few environment variables for tuning live stream resolutio
 
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`
   Limits concurrent Playwright resolutions across requests. Default: `4`
+- `DLHD_CHANNEL_STREAM_MAX_RESULTS`
+  Stops channel resolution after this many working stream options. Default: `2`
+- `DLHD_CHANNEL_STREAM_MAX_ATTEMPTS`
+  Caps how many player pages are tried for one channel before returning. Default: `3`
 - `DLHD_LIVE_STREAM_MAX_WORKERS`
   Limits parallel channel attempts within one live event request. Default: `4`
 - `DLHD_LIVE_STREAM_MAX_RESULTS`
@@ -204,6 +208,8 @@ You can override these in `.env` or your deployment platform:
 - `PORT`: service listen port inside the container. Default: `7000`
 - `DLHD_BASE_URL`: upstream site base URL. Default: `https://dlstreams.top`
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`: max simultaneous Playwright resolutions. Default: `4`
+- `DLHD_CHANNEL_STREAM_MAX_RESULTS`: max stream options returned for one channel. Default: `2`
+- `DLHD_CHANNEL_STREAM_MAX_ATTEMPTS`: max player pages attempted for one channel. Default: `3`
 - `DLHD_LIVE_STREAM_MAX_WORKERS`: max parallel linked-channel attempts inside one live request. Default: `4`
 - `DLHD_LIVE_STREAM_MAX_RESULTS`: max stream options returned for a large live event. Default: `4`
 - `DLHD_LIVE_STREAM_MAX_ATTEMPTS`: max linked channels attempted for a live event. Default: `6`

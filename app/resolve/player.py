@@ -5,7 +5,7 @@ import logging
 import re
 import threading
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -231,6 +231,98 @@ def _scan_text(text: str) -> list[str]:
     return found
 
 
+def _scan_html_for_manifests(html: str, base_url: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    soup = BeautifulSoup(html, "html.parser")
+
+    for attr in STREAM_ATTRS:
+        for element in soup.find_all(attrs={attr: True}):
+            url = _abs((element.get(attr) or "").strip(), base_url)
+            if url and _is_manifest(url) and url not in seen:
+                seen.add(url)
+                found.append(url)
+
+    for element in soup.find_all(attrs={"data-setup": True}):
+        _extract_json_streams(element.get("data-setup", ""), base_url, found, seen)
+
+    for script in soup.find_all("script"):
+        text = script.get_text() or ""
+        for block in re.findall(r'\.setup\s*\(\s*(\{.+?\})\s*\)', text, re.S):
+            _extract_json_streams(block, base_url, found, seen)
+
+    for url in _scan_text(html):
+        if url not in seen:
+            seen.add(url)
+            found.append(url)
+
+    for url in _extract_embed_proxy_manifest(html):
+        if url not in seen:
+            seen.add(url)
+            found.append(url)
+
+    return found
+
+
+def _extract_iframe_urls(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    urls: list[str] = []
+    seen: set[str] = set()
+    for iframe in soup.find_all("iframe", src=True):
+        url = _abs((iframe.get("src") or "").strip(), base_url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def _fetch_html(url: str, referer: str | None = None, timeout: int | None = None) -> tuple[str, str]:
+    with build_session() as session:
+        if referer:
+            session.headers.update({"Referer": referer})
+        response = session.get(
+            url,
+            timeout=timeout or settings.HTTP_TIMEOUT_SECONDS,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        response.encoding = response.encoding or "utf-8"
+        return response.text, response.url
+
+
+def _resolve_player_static(label: str, player_url: str) -> PlayerResolution | None:
+    result = PlayerResolution(label=label, player_page_url=player_url)
+    try:
+        html, final_url = _fetch_html(player_url)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("Static player fetch failed for %s: %s", player_url, exc)
+        return None
+
+    result.player_final_url = final_url
+    dom_hits = _hits(_scan_html_for_manifests(html, final_url), final_url)
+    iframe_urls = _extract_iframe_urls(html, final_url)
+    result.iframes_seen = iframe_urls
+
+    iframe_hits: list[tuple[str, str]] = []
+    iframe_seen: set[str] = set()
+    for iframe_url in iframe_urls:
+        _append_unique_hits(
+            iframe_hits,
+            iframe_seen,
+            _hits(_extract_embed_proxy_manifest_from_url(iframe_url, final_url), iframe_url),
+        )
+
+    _populate_manifest_results(
+        result=result,
+        network_hits=[],
+        dom_hits=dom_hits,
+        js_hits=[],
+        iframe_hits=iframe_hits,
+    )
+    return result if result.manifests else None
+
+
 def _hits(values: Iterable[str], found_at_url: str) -> list[tuple[str, str]]:
     return [(value, found_at_url) for value in values]
 
@@ -323,40 +415,12 @@ def _extract_json_streams(raw: str, base: str | None, found: list[str], seen: se
 
 
 def _dom_scan(frame_or_page: Any, base_url: str) -> list[str]:
-    found: list[str] = []
-    seen: set[str] = set()
     try:
         html = frame_or_page.content()
-        soup = BeautifulSoup(html, "html.parser")
-
-        for attr in STREAM_ATTRS:
-            for element in soup.find_all(attrs={attr: True}):
-                url = _abs((element.get(attr) or "").strip(), base_url)
-                if url and _is_manifest(url) and url not in seen:
-                    seen.add(url)
-                    found.append(url)
-
-        for element in soup.find_all(attrs={"data-setup": True}):
-            _extract_json_streams(element.get("data-setup", ""), base_url, found, seen)
-
-        for script in soup.find_all("script"):
-            text = script.get_text() or ""
-            for block in re.findall(r'\.setup\s*\(\s*(\{.+?\})\s*\)', text, re.S):
-                _extract_json_streams(block, base_url, found, seen)
-
-        for url in _scan_text(html):
-            if url not in seen:
-                seen.add(url)
-                found.append(url)
-
-        for url in _extract_embed_proxy_manifest(html):
-            if url not in seen:
-                seen.add(url)
-                found.append(url)
+        return _scan_html_for_manifests(html, base_url)
     except Exception as exc:  # noqa: BLE001
         LOGGER.debug("DOM scan failed on %s: %s", base_url, exc)
-
-    return found
+        return []
 
 
 def _js_eval_streams(frame_or_page: Any, base_url: str) -> list[str]:
@@ -412,6 +476,10 @@ class PlaywrightResolver:
         return results
 
     def resolve_player(self, label: str, player_url: str) -> PlayerResolution:
+        static_result = _resolve_player_static(label, player_url)
+        if static_result is not None:
+            return static_result
+
         result = PlayerResolution(label=label, player_page_url=player_url)
         network_hits: list[tuple[str, str]] = []
         network_seen: set[str] = set()

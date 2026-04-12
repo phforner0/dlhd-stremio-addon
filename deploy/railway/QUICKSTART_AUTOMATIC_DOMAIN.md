@@ -36,7 +36,7 @@ Copy these values into the Railway service variables:
 DLHD_BASE_URL=https://dlstreams.top
 DLHD_ADDON_ID=com.dlhd.stremio
 DLHD_ADDON_NAME=DLHD Streams
-DLHD_ADDON_VERSION=0.1.1
+DLHD_ADDON_VERSION=0.1.2
 DLHD_ADDON_DESCRIPTION=Scraped live channels and schedule grouped by country for Stremio.
 DLHD_HTTP_TIMEOUT=20
 DLHD_PLAYWRIGHT_WAIT=6

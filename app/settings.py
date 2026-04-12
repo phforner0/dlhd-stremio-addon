@@ -5,7 +5,7 @@ import os
 BASE_SITE_URL = os.getenv("DLHD_BASE_URL", "https://dlstreams.top").rstrip("/")
 ADDON_ID = os.getenv("DLHD_ADDON_ID", "com.dlhd.stremio")
 ADDON_NAME = os.getenv("DLHD_ADDON_NAME", "DLHD Streams")
-ADDON_VERSION = os.getenv("DLHD_ADDON_VERSION", "0.1.1")
+ADDON_VERSION = os.getenv("DLHD_ADDON_VERSION", "0.1.2")
 ADDON_DESCRIPTION = os.getenv(
     "DLHD_ADDON_DESCRIPTION",
     "Scraped live channels and schedule grouped by country for Stremio.",
@@ -15,6 +15,8 @@ HTTP_TIMEOUT_SECONDS = int(os.getenv("DLHD_HTTP_TIMEOUT", "20"))
 PLAYWRIGHT_WAIT_SECONDS = int(os.getenv("DLHD_PLAYWRIGHT_WAIT", "6"))
 PLAYWRIGHT_TIMEOUT_MS = int(os.getenv("DLHD_PLAYWRIGHT_TIMEOUT_MS", "20000"))
 PLAYWRIGHT_MAX_CONCURRENCY = int(os.getenv("DLHD_PLAYWRIGHT_MAX_CONCURRENCY", "4"))
+CHANNEL_STREAM_MAX_RESULTS = int(os.getenv("DLHD_CHANNEL_STREAM_MAX_RESULTS", "2"))
+CHANNEL_STREAM_MAX_ATTEMPTS = int(os.getenv("DLHD_CHANNEL_STREAM_MAX_ATTEMPTS", "3"))
 LIVE_STREAM_MAX_WORKERS = int(
     os.getenv("DLHD_LIVE_STREAM_MAX_WORKERS", str(min(PLAYWRIGHT_MAX_CONCURRENCY, 4)))
 )
