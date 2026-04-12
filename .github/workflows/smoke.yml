@@ -1,0 +1,120 @@
+name: Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: Public addon base URL to check, e.g. https://foo.up.railway.app
+        required: false
+        type: string
+  schedule:
+    - cron: "17 * * * *"
+
+jobs:
+  local-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+          playwright install chromium
+
+      - name: Start addon locally
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 7000 > smoke-local.log 2>&1 &
+          sleep 10
+
+      - name: Run local smoke checks
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          base = "http://127.0.0.1:7000"
+
+          def get_json(path: str) -> dict:
+              with urllib.request.urlopen(base + path, timeout=60) as resp:
+                  return json.load(resp)
+
+          health = get_json("/healthz")
+          assert health["ok"] is True
+
+          manifest = get_json("/manifest.json")
+          assert manifest["version"] == "0.1.3"
+          assert len(manifest["catalogs"]) == 28
+
+          channels = get_json("/catalog/tv/channels_br.json")
+          assert channels["metas"]
+
+          meta = get_json("/meta/tv/dlhd:ch:81.json")
+          assert meta["meta"]["behaviorHints"]["defaultVideoId"] == "dlhd:ch:81"
+          assert meta["meta"]["videos"]
+
+          stream = get_json("/stream/tv/dlhd:ch:81.json")
+          assert stream["streams"]
+          assert "/proxy/stream.m3u8" in stream["streams"][0]["url"]
+          PY
+
+      - name: Upload local smoke log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-local-log
+          path: smoke-local.log
+
+  deployed-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ADDON_BASE_URL: ${{ inputs.base_url || vars.ADDON_BASE_URL }}
+      SMOKE_CHANNEL_ID: ${{ vars.SMOKE_CHANNEL_ID || '81' }}
+
+    steps:
+      - name: Check deployed base URL is configured
+        if: env.ADDON_BASE_URL == ''
+        run: |
+          echo "ADDON_BASE_URL is not configured."
+          echo "Set repository variable ADDON_BASE_URL or pass workflow_dispatch input base_url."
+          exit 1
+
+      - name: Smoke deployed addon
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          base = os.environ["ADDON_BASE_URL"].rstrip("/")
+          channel_id = os.environ["SMOKE_CHANNEL_ID"]
+
+          def get_json(url: str) -> dict:
+              with urllib.request.urlopen(url, timeout=90) as resp:
+                  return json.load(resp)
+
+          health = get_json(base + "/healthz")
+          assert health["ok"] is True
+
+          manifest = get_json(base + "/manifest.json")
+          assert manifest["catalogs"]
+
+          channels = get_json(base + "/catalog/tv/channels_br.json")
+          assert channels["metas"]
+
+          meta = get_json(base + f"/meta/tv/dlhd:ch:{channel_id}.json")
+          assert meta["meta"]["videos"]
+
+          stream = get_json(base + f"/stream/tv/dlhd:ch:{channel_id}.json")
+          assert stream["streams"]
+          PY

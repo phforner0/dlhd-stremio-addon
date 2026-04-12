@@ -1,8 +1,0 @@
-beautifulsoup4<5,>=4.12
-fastapi<1,>=0.115
-playwright<2,>=1.52
-requests<3,>=2.32
-uvicorn[standard]<1,>=0.34
-
-[dev]
-pytest<9,>=8.3

@@ -82,6 +82,33 @@ http://localhost:7000/manifest.json
 - VPS production checklist: [`deploy/vps/PRODUCTION_CHECKLIST.md`](deploy/vps/PRODUCTION_CHECKLIST.md)
 - Standalone repo move guide: [`STANDALONE_REPO.md`](STANDALONE_REPO.md)
 
+## GitHub Actions
+
+This repo includes:
+
+- `.github/workflows/ci.yml`
+  Runs `compileall`, `pytest`, and a Docker image build on push/PR.
+- `.github/workflows/smoke.yml`
+  Supports manual local smoke checks and scheduled/manual checks against a deployed addon URL.
+
+Repository variables for `smoke.yml`:
+
+- `ADDON_BASE_URL`
+  Public addon base URL, for example `https://dlhd-stremio-addon-production.up.railway.app`
+- `SMOKE_CHANNEL_ID`
+  Optional channel used for deployed smoke checks. Default: `81`
+
+Repository secrets:
+
+- none required by default
+
+Recommended first setup:
+
+1. add repository variable `ADDON_BASE_URL`
+2. optionally add `SMOKE_CHANNEL_ID`
+3. run `Smoke` manually once
+4. keep the scheduled smoke workflow enabled for production monitoring
+
 ## Public HTTPS Deployment
 
 For public Stremio installs, put the addon behind HTTPS.
