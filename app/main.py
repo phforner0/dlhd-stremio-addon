@@ -212,7 +212,10 @@ def _configure_page(request: Request) -> str:
     select, button {{ width: 100%; padding: 12px; font-size: 16px; border-radius: 8px; border: 1px solid #374151; }}
     select {{ background: #0f172a; color: #fff; }}
     button {{ margin-top: 20px; background: #8b5cf6; color: #fff; cursor: pointer; border: 0; }}
+    button.secondary {{ background: #1f2937; }}
     a {{ color: #93c5fd; }}
+    code {{ display: block; margin-top: 12px; padding: 12px; background: #0f172a; border-radius: 8px; color: #e5e7eb; word-break: break-all; }}
+    .help {{ margin-top: 12px; font-size: 14px; }}
   </style>
 </head>
 <body>
@@ -221,10 +224,13 @@ def _configure_page(request: Request) -> str:
   <label for=\"scheduleOffsetMin\">Schedule Timezone</label>
   <select id=\"scheduleOffsetMin\">{''.join(options)}</select>
   <button id=\"installBtn\">Install in Stremio</button>
-  <p id=\"manifestUrl\"></p>
+  <button id=\"copyBtn\" class=\"secondary\" type=\"button\">Copy manifest URL</button>
+  <p class=\"help\">If the install button opens a page-not-found screen, copy the manifest URL below and paste it manually inside Stremio.</p>
+  <code id=\"manifestUrl\"></code>
   <script>
     const select = document.getElementById('scheduleOffsetMin');
     const installBtn = document.getElementById('installBtn');
+    const copyBtn = document.getElementById('copyBtn');
     const manifestUrl = document.getElementById('manifestUrl');
     function currentManifest() {{
       const payload = encodeURIComponent(JSON.stringify({{ scheduleOffsetMin: select.value }}));
@@ -289,7 +295,10 @@ def _configure_page_v2(request: Request) -> str:
     select, button {{ width: 100%; padding: 12px; font-size: 16px; border-radius: 8px; border: 1px solid #374151; }}
     select {{ background: #0f172a; color: #fff; }}
     button {{ margin-top: 20px; background: #8b5cf6; color: #fff; cursor: pointer; border: 0; }}
+    button.secondary {{ background: #1f2937; }}
     a {{ color: #93c5fd; }}
+    code {{ display: block; margin-top: 12px; padding: 12px; background: #0f172a; border-radius: 8px; color: #e5e7eb; word-break: break-all; }}
+    .help {{ margin-top: 12px; font-size: 14px; }}
   </style>
 </head>
 <body>
@@ -297,11 +306,14 @@ def _configure_page_v2(request: Request) -> str:
   <p>Choose what appears and how the addon behaves for this installation. Each user can install with different settings.</p>
   {fields_html}
   <button id=\"installBtn\">Install in Stremio</button>
-  <p id=\"manifestUrl\"></p>
+  <button id=\"copyBtn\" class=\"secondary\" type=\"button\">Copy manifest URL</button>
+  <p class=\"help\">If the install button opens a page-not-found screen, copy the manifest URL below and paste it manually inside Stremio.</p>
+  <code id=\"manifestUrl\"></code>
   <script>
     const fields = ['scheduleOffsetMin', 'catalogMode', 'preferredCountryCode', 'channelStreamResults', 'liveStreamResults', 'eventStaleAfterMinutes']
       .map((id) => document.getElementById(id));
     const installBtn = document.getElementById('installBtn');
+    const copyBtn = document.getElementById('copyBtn');
     const manifestUrl = document.getElementById('manifestUrl');
     function encodeConfig(config) {{
       const json = JSON.stringify(config);
@@ -318,8 +330,20 @@ def _configure_page_v2(request: Request) -> str:
     function refresh() {{
       manifestUrl.textContent = currentManifest();
     }}
+    async function copyManifest() {{
+      try {{
+        await navigator.clipboard.writeText(currentManifest());
+        copyBtn.textContent = 'Manifest URL copied';
+        setTimeout(() => {{ copyBtn.textContent = 'Copy manifest URL'; }}, 1500);
+      }} catch (err) {{
+        copyBtn.textContent = 'Copy failed';
+        setTimeout(() => {{ copyBtn.textContent = 'Copy manifest URL'; }}, 1500);
+      }}
+    }}
     fields.forEach((field) => field.addEventListener('change', refresh));
-    installBtn.addEventListener('click', () => {{
+    copyBtn.addEventListener('click', copyManifest);
+    installBtn.addEventListener('click', async () => {{
+      await copyManifest();
       window.location.href = currentManifest().replace('https://', 'stremio://').replace('http://', 'stremio://');
     }});
     refresh();
