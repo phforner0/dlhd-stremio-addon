@@ -240,6 +240,8 @@ The service exposes a few environment variables for tuning live stream resolutio
   Caches fully built `stream` endpoint responses. Default: `120`
 - `DLHD_LIVE_CHANNEL_CACHE_TTL`
   Caches the first successful live-channel resolution payload so later live events can reuse it. Default: `120`
+- `DLHD_HLS_PLAYLIST_CACHE_TTL`
+  Caches rewritten HLS playlists to reduce repeated proxy work. Default: `15`
 
 The addon now uses two complementary live caches:
 
@@ -263,6 +265,7 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_WATCH_CACHE_TTL`: `watch.php` metadata cache TTL. Default: `1800`
 - `DLHD_STREAM_CACHE_TTL`: event/channel stream response cache TTL. Default: `120`
 - `DLHD_LIVE_CHANNEL_CACHE_TTL`: per-channel live resolution cache TTL. Default: `120`
+- `DLHD_HLS_PLAYLIST_CACHE_TTL`: rewritten HLS playlist cache TTL. Default: `15`
 - `DLHD_FAILED_STREAM_CACHE_TTL`: currently used for local tuning only. Default: `30`
 
 Production-oriented examples included:

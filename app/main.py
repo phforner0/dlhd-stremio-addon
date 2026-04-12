@@ -36,15 +36,26 @@ app.add_middleware(
 )
 
 channels_cache: TTLCache[list[CatalogChannel]] = TTLCache()
+channel_index_cache: TTLCache[dict[int, CatalogChannel]] = TTLCache()
 schedule_cache: TTLCache[list[LiveEvent]] = TTLCache()
+schedule_index_cache: TTLCache[dict[str, LiveEvent]] = TTLCache()
 watch_cache: TTLCache[WrapperCatalog] = TTLCache()
 stream_cache: TTLCache[list[dict]] = TTLCache()
 live_channel_stream_cache: TTLCache[dict[str, str]] = TTLCache()
+playlist_cache: TTLCache[str] = TTLCache()
 resolver = PlaywrightResolver()
 
 
 def _service_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
+
+
+def _playlist_cache_key(url: str, referer: str) -> str:
+    return f"playlist:{url}|{referer}"
+
+
+def _looks_like_hls_playlist(body: str) -> bool:
+    return body.lstrip().startswith("#EXTM3U")
 
 
 def _poster_url(request: Request, meta_id: str) -> str:
@@ -79,12 +90,21 @@ def get_channels() -> list[CatalogChannel]:
 
 
 def get_channel_index() -> dict[int, CatalogChannel]:
-    return {channel.channel_id: channel for channel in get_channels()}
+    return channel_index_cache.remember(
+        "channels:index",
+        settings.CHANNELS_CACHE_TTL_SECONDS,
+        lambda: {channel.channel_id: channel for channel in get_channels()},
+    )
 
 
 def refresh_schedule() -> list[LiveEvent]:
     events = scrape_schedule(get_channel_index())
     schedule_cache.set("schedule", events, settings.SCHEDULE_CACHE_TTL_SECONDS)
+    schedule_index_cache.set(
+        "schedule:index",
+        {event.meta_id: event for event in events},
+        settings.SCHEDULE_CACHE_TTL_SECONDS,
+    )
     return events
 
 
@@ -93,6 +113,14 @@ def get_schedule() -> list[LiveEvent]:
         "schedule",
         settings.SCHEDULE_CACHE_TTL_SECONDS,
         lambda: scrape_schedule(get_channel_index()),
+    )
+
+
+def get_schedule_index() -> dict[str, LiveEvent]:
+    return schedule_index_cache.remember(
+        "schedule:index",
+        settings.SCHEDULE_CACHE_TTL_SECONDS,
+        lambda: {event.meta_id: event for event in get_schedule()},
     )
 
 
@@ -219,17 +247,6 @@ def _rewrite_hls_playlist(request: Request, body: str, playlist_url: str, refere
     return "\n".join(rewritten) + ("\n" if body.endswith("\n") else "")
 
 
-def _is_playlist_response(url: str, content_type: str | None) -> bool:
-    lowered_path = urlparse(url).path.lower()
-    lowered_type = (content_type or "").lower()
-    return (
-        lowered_path.endswith(".m3u8")
-        or lowered_path.endswith(".css")
-        or "mpegurl" in lowered_type
-        or lowered_type in {"text/plain", "text/txt"}
-    )
-
-
 def _stream_upstream(upstream, session):
     try:
         for chunk in upstream.iter_content(chunk_size=256 * 1024):
@@ -253,12 +270,14 @@ def _remember_streams(cache_key: str, factory) -> list[dict]:
     cached = stream_cache.get(cache_key)
     if cached is not None:
         return cached
+
     streams = factory()
-    if not streams:
-        streams = factory()
-    if not streams:
-        return []
-    return stream_cache.set(cache_key, streams, settings.STREAM_CACHE_TTL_SECONDS)
+    ttl_seconds = (
+        settings.STREAM_CACHE_TTL_SECONDS
+        if streams
+        else settings.FAILED_STREAM_CACHE_TTL_SECONDS
+    )
+    return stream_cache.set(cache_key, streams, ttl_seconds)
 
 
 def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[dict]:
@@ -421,13 +440,12 @@ def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
 
 
 def _find_event(meta_id: str) -> LiveEvent | None:
-    for event in get_schedule():
-        if event.meta_id == meta_id:
-            return event
-    for event in refresh_schedule():
-        if event.meta_id == meta_id:
-            return event
-    return None
+    event = get_schedule_index().get(meta_id)
+    if event is not None:
+        return event
+
+    refresh_schedule()
+    return get_schedule_index().get(meta_id)
 
 
 @app.on_event("shutdown")
@@ -485,8 +503,9 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
         channel_id = value
         channel_index = get_channel_index()
         channel = channel_index.get(channel_id)
-        wrapper = get_wrapper(channel_id)
+        wrapper = watch_cache.get(f"watch:{channel_id}")
         if channel is None:
+            wrapper = wrapper or get_wrapper(channel_id)
             channel = CatalogChannel(
                 channel_id=channel_id,
                 name=wrapper.channel.name or wrapper.page.title or f"Channel {channel_id}",
@@ -504,7 +523,11 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
             "poster": _poster_url(request, channel.meta_id),
             "posterShape": "poster",
             "background": _poster_url(request, channel.meta_id),
-            "description": wrapper.page.description or f"{channel.country_label} channel",
+            "description": (
+                wrapper.page.description
+                if wrapper is not None and wrapper.page.description
+                else f"{channel.country_label} channel • ID {channel.channel_id}"
+            ),
             "genres": [channel.country_label],
             "videos": [_default_video(channel.meta_id, channel.name)],
             "behaviorHints": {"defaultVideoId": channel.meta_id},
@@ -565,6 +588,13 @@ def proxy_media(
     url: str = Query(...),
     referer: str = Query(...),
 ) -> Response:
+    playlist_cache_key = None
+    if filename.lower().endswith(".m3u8"):
+        playlist_cache_key = _playlist_cache_key(url, referer)
+        cached_playlist = playlist_cache.get(playlist_cache_key)
+        if cached_playlist is not None:
+            return Response(content=cached_playlist, media_type="application/vnd.apple.mpegurl")
+
     session = build_session()
     session.headers.update({"Referer": referer})
 
@@ -576,11 +606,20 @@ def proxy_media(
     upstream.raise_for_status()
     content_type = upstream.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
 
-    if _is_playlist_response(upstream.url, content_type):
+    if playlist_cache_key is not None:
         body = upstream.text
-        rewritten = _rewrite_hls_playlist(request, body, upstream.url, referer)
         upstream.close()
         session.close()
+
+        if not _looks_like_hls_playlist(body):
+            return Response(content=body, media_type=content_type or "text/plain")
+
+        rewritten = _rewrite_hls_playlist(request, body, upstream.url, referer)
+        playlist_cache.set(
+            playlist_cache_key,
+            rewritten,
+            settings.HLS_PLAYLIST_CACHE_TTL_SECONDS,
+        )
         return Response(content=rewritten, media_type="application/vnd.apple.mpegurl")
 
     response_headers = {}
