@@ -228,6 +228,10 @@ The service exposes a few environment variables for tuning live stream resolutio
   Limits concurrent Playwright resolutions across requests. Default: `4`
 - `DLHD_PLAYWRIGHT_REUSE_BROWSER`
   Reuses one Playwright browser per worker thread to reduce cold-start cost. Default: `1`
+- `DLHD_PLAYWRIGHT_BROWSER_MAX_USES`
+  Recycles a reused browser after this many resolutions. Default: `12`
+- `DLHD_PLAYWRIGHT_BROWSER_MAX_IDLE_SECONDS`
+  Recycles a reused browser after this idle period in seconds. Default: `45`
 - `DLHD_CHANNEL_STREAM_MAX_RESULTS`
   Stops channel resolution after this many working stream options. Default: `2`
 - `DLHD_CHANNEL_STREAM_MAX_ATTEMPTS`
@@ -266,6 +270,8 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_HTTP_POOL_MAXSIZE`: pooled upstream HTTP max size. Default: `64`
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`: max simultaneous Playwright resolutions. Default: `4`
 - `DLHD_PLAYWRIGHT_REUSE_BROWSER`: reuse one Playwright browser per worker thread. Default: `1`
+- `DLHD_PLAYWRIGHT_BROWSER_MAX_USES`: recycle a reused browser after this many resolutions. Default: `12`
+- `DLHD_PLAYWRIGHT_BROWSER_MAX_IDLE_SECONDS`: recycle a reused browser after this idle time in seconds. Default: `45`
 - `DLHD_CHANNEL_STREAM_MAX_RESULTS`: max stream options returned for one channel. Default: `2`
 - `DLHD_CHANNEL_STREAM_MAX_ATTEMPTS`: max player pages attempted for one channel. Default: `3`
 - `DLHD_LIVE_STREAM_MAX_WORKERS`: max parallel linked-channel attempts inside one live request. Default: `4`

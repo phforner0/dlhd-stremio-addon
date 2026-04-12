@@ -488,14 +488,16 @@ class PlaywrightResolver:
         self._semaphore = threading.BoundedSemaphore(settings.PLAYWRIGHT_MAX_CONCURRENCY)
         self._thread_state = threading.local()
         self._browser_guard = threading.Lock()
-        self._thread_browsers: dict[int, tuple[Any, Any]] = {}
+        self._thread_browsers: dict[int, dict[str, Any]] = {}
 
     def close(self) -> None:
         with self._browser_guard:
             browsers = list(self._thread_browsers.values())
             self._thread_browsers.clear()
 
-        for playwright, browser in browsers:
+        for state in browsers:
+            playwright = state.get("playwright")
+            browser = state.get("browser")
             try:
                 browser.close()
             except Exception:
@@ -507,11 +509,11 @@ class PlaywrightResolver:
 
     def _drop_thread_browser(self) -> None:
         thread_id = threading.get_ident()
-        browser = getattr(self._thread_state, "browser", None)
-        playwright = getattr(self._thread_state, "playwright", None)
+        state = getattr(self._thread_state, "browser_state", None)
+        browser = state.get("browser") if state else None
+        playwright = state.get("playwright") if state else None
 
-        self._thread_state.browser = None
-        self._thread_state.playwright = None
+        self._thread_state.browser_state = None
 
         with self._browser_guard:
             self._thread_browsers.pop(thread_id, None)
@@ -537,25 +539,58 @@ class PlaywrightResolver:
 
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(headless=True)
-        self._thread_state.playwright = playwright
-        self._thread_state.browser = browser
+        now = time.monotonic()
+        state = {
+            "playwright": playwright,
+            "browser": browser,
+            "uses": 0,
+            "created_at": now,
+            "last_used_at": now,
+        }
+        self._thread_state.browser_state = state
 
         with self._browser_guard:
-            self._thread_browsers[threading.get_ident()] = (playwright, browser)
+            self._thread_browsers[threading.get_ident()] = state
 
         return browser
 
     def _get_thread_browser(self) -> Any:
-        browser = getattr(self._thread_state, "browser", None)
+        state = getattr(self._thread_state, "browser_state", None)
+        browser = state.get("browser") if state else None
         if browser is not None:
             try:
                 if browser.is_connected():
+                    if (
+                        settings.PLAYWRIGHT_BROWSER_MAX_USES > 0
+                        and state is not None
+                        and state["uses"] >= settings.PLAYWRIGHT_BROWSER_MAX_USES
+                    ):
+                        LOGGER.debug("recycling Playwright browser after max uses=%s", state["uses"])
+                        self._drop_thread_browser()
+                        return self._start_thread_browser()
+
+                    if (
+                        settings.PLAYWRIGHT_BROWSER_MAX_IDLE_SECONDS > 0
+                        and state is not None
+                        and (time.monotonic() - state["last_used_at"]) >= settings.PLAYWRIGHT_BROWSER_MAX_IDLE_SECONDS
+                    ):
+                        LOGGER.debug("recycling Playwright browser after idle_seconds=%s", round(time.monotonic() - state["last_used_at"], 2))
+                        self._drop_thread_browser()
+                        return self._start_thread_browser()
+
                     return browser
             except Exception:
                 pass
             self._drop_thread_browser()
 
         return self._start_thread_browser()
+
+    def _mark_thread_browser_used(self) -> None:
+        state = getattr(self._thread_state, "browser_state", None)
+        if state is None:
+            return
+        state["uses"] += 1
+        state["last_used_at"] = time.monotonic()
 
     def resolve_wrapper(
         self,
@@ -816,6 +851,8 @@ class PlaywrightResolver:
                     context.close()
                 except Exception:
                     pass
+                if settings.PLAYWRIGHT_REUSE_BROWSER:
+                    self._mark_thread_browser_used()
                 if transient_browser is not None:
                     try:
                         transient_browser.close()
