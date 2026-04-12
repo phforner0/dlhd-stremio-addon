@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 import logging
 
@@ -110,7 +111,7 @@ def _channel_preview(channel: CatalogChannel, request: Request) -> dict:
         "type": "tv",
         "name": channel.name,
         "poster": _poster_url(request, channel.meta_id),
-        "posterShape": "regular",
+        "posterShape": "poster",
         "description": f"{channel.country_label} channel • ID {channel.channel_id}",
         "genres": [channel.country_label],
     }
@@ -123,7 +124,7 @@ def _event_preview(event: LiveEvent, request: Request) -> dict:
         "type": "tv",
         "name": event.title,
         "poster": _poster_url(request, event.meta_id),
-        "posterShape": "regular",
+        "posterShape": "poster",
         "description": f"{event.day_label} • {event.time_text} • {event.category}",
         "genres": [event.category, *country_labels],
     }
@@ -161,6 +162,15 @@ def _manifest_to_stream(
                 }
             },
         },
+    }
+
+
+def _default_video(meta_id: str, title: str) -> dict:
+    return {
+        "id": meta_id,
+        "title": title,
+        "released": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "available": True,
     }
 
 
@@ -383,10 +393,12 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
             "type": "tv",
             "name": channel.name,
             "poster": _poster_url(request, channel.meta_id),
-            "posterShape": "regular",
+            "posterShape": "poster",
             "background": _poster_url(request, channel.meta_id),
             "description": wrapper.page.description or f"{channel.country_label} channel",
             "genres": [channel.country_label],
+            "videos": [_default_video(channel.meta_id, channel.name)],
+            "behaviorHints": {"defaultVideoId": channel.meta_id},
         }
         return JSONResponse({"meta": meta_payload})
 
@@ -399,13 +411,15 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
         "type": "tv",
         "name": event.title,
         "poster": _poster_url(request, event.meta_id),
-        "posterShape": "regular",
+        "posterShape": "poster",
         "background": _poster_url(request, event.meta_id),
         "description": (
             f"{event.day_label} • {event.time_text} • {event.category}\n"
             f"Channels: {', '.join(channel.name for channel in event.channels)}"
         ),
         "genres": [event.category, *[_country_label(code) for code in event.country_codes]],
+        "videos": [_default_video(event.meta_id, event.title)],
+        "behaviorHints": {"defaultVideoId": event.meta_id},
     }
     return JSONResponse({"meta": meta_payload})
 
