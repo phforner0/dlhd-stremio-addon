@@ -116,6 +116,50 @@ def _schedule_offset_minutes(config: dict[str, str]) -> int:
         return settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES
 
 
+def _int_config_value(config: dict[str, str], key: str, default: int, allowed: set[int]) -> int:
+    raw_value = config.get(key)
+    if raw_value is None:
+        return default
+
+    raw_number = raw_value.split("|", 1)[0]
+    try:
+        parsed = int(raw_number)
+    except ValueError:
+        return default
+    return parsed if parsed in allowed else default
+
+
+def _catalog_mode(config: dict[str, str]) -> str:
+    return config.get("catalogMode", "full").split("|", 1)[0]
+
+
+def _preferred_country_code(config: dict[str, str]) -> str | None:
+    raw_value = config.get("preferredCountryCode", "all").split("|", 1)[0]
+    if raw_value in {"", "all"}:
+        return None
+    return raw_value if raw_value in settings.COUNTRY_LABELS else None
+
+
+def _channel_stream_result_limit(config: dict[str, str]) -> int:
+    return _int_config_value(config, "channelStreamResults", settings.CHANNEL_STREAM_MAX_RESULTS, {1, 2})
+
+
+def _live_stream_result_limit(config: dict[str, str]) -> int:
+    return _int_config_value(config, "liveStreamResults", settings.LIVE_STREAM_MAX_RESULTS, {1, 2, 4})
+
+
+def _event_stale_after_minutes(config: dict[str, str]) -> int:
+    return _int_config_value(config, "eventStaleAfterMinutes", settings.EVENT_STALE_AFTER_MINUTES, {120, 360, 720})
+
+
+def _config_fingerprint(config: dict[str, str], keys: tuple[str, ...]) -> str:
+    parts = []
+    for key in keys:
+        if key in config:
+            parts.append(f"{key}={config[key]}")
+    return "|".join(parts) or "default"
+
+
 def _event_display_values(event: LiveEvent, config: dict[str, str]) -> tuple[str, str]:
     if event.scheduled_at_utc is None:
         return event.day_label, event.time_text
@@ -180,11 +224,101 @@ def _configure_page(request: Request) -> str:
 </html>"""
 
 
+def _configure_page_v2(request: Request) -> str:
+    def select_html(field_id: str, title: str, options: list[tuple[str, str]], default_value: str) -> str:
+        rendered = []
+        for value, label in options:
+            selected = " selected" if value == default_value else ""
+            rendered.append(f'<option value="{value}"{selected}>{label}</option>')
+        return f'<label for="{field_id}">{title}</label><select id="{field_id}">{"".join(rendered)}</select>'
+
+    timezone_options = []
+    for minutes in range(-12 * 60, 14 * 60 + 1, 30):
+        sign = "+" if minutes >= 0 else "-"
+        absolute = abs(minutes)
+        hours = absolute // 60
+        mins = absolute % 60
+        timezone_options.append((str(minutes), f"GMT {sign}{hours:02d}:{mins:02d}"))
+
+    country_options = [("all", "All Countries")]
+    for country_code in settings.VISIBLE_COUNTRY_CODES:
+        country_options.append((country_code, settings.COUNTRY_LABELS[country_code]))
+
+    fields_html = "".join(
+        [
+            select_html("scheduleOffsetMin", "Schedule Timezone", timezone_options, str(settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES)),
+            select_html("catalogMode", "Catalog Mode", [("full", "All catalogs"), ("focused", "Only all + one country + global")], "full"),
+            select_html("preferredCountryCode", "Preferred Country", country_options, "all"),
+            select_html("channelStreamResults", "Channel Stream Options", [("1", "Best only"), ("2", "Two options")], str(settings.CHANNEL_STREAM_MAX_RESULTS)),
+            select_html("liveStreamResults", "Live Stream Options", [("1", "Best only"), ("2", "Two options"), ("4", "More options")], str(settings.LIVE_STREAM_MAX_RESULTS)),
+            select_html("eventStaleAfterMinutes", "Hide Finished Events After", [("120", "2 hours"), ("360", "6 hours"), ("720", "12 hours")], str(settings.EVENT_STALE_AFTER_MINUTES)),
+        ]
+    )
+
+    base_url = str(request.base_url).rstrip("/")
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>{settings.ADDON_NAME} Configure</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; background: #111827; color: #fff; }}
+    h1 {{ margin-bottom: 8px; }}
+    p {{ color: #d1d5db; line-height: 1.5; }}
+    label {{ display: block; margin: 18px 0 8px; font-weight: 700; }}
+    select, button {{ width: 100%; padding: 12px; font-size: 16px; border-radius: 8px; border: 1px solid #374151; }}
+    select {{ background: #0f172a; color: #fff; }}
+    button {{ margin-top: 20px; background: #8b5cf6; color: #fff; cursor: pointer; border: 0; }}
+    a {{ color: #93c5fd; }}
+  </style>
+</head>
+<body>
+  <h1>{settings.ADDON_NAME}</h1>
+  <p>Choose what appears and how the addon behaves for this installation. Each user can install with different settings.</p>
+  {fields_html}
+  <button id=\"installBtn\">Install in Stremio</button>
+  <p id=\"manifestUrl\"></p>
+  <script>
+    const fields = ['scheduleOffsetMin', 'catalogMode', 'preferredCountryCode', 'channelStreamResults', 'liveStreamResults', 'eventStaleAfterMinutes']
+      .map((id) => document.getElementById(id));
+    const installBtn = document.getElementById('installBtn');
+    const manifestUrl = document.getElementById('manifestUrl');
+    function currentManifest() {{
+      const config = Object.fromEntries(fields.map((field) => [field.id, field.value]));
+      const payload = encodeURIComponent(JSON.stringify(config));
+      return `{base_url}/${{payload}}/manifest.json`;
+    }}
+    function refresh() {{
+      manifestUrl.textContent = currentManifest();
+    }}
+    fields.forEach((field) => field.addEventListener('change', refresh));
+    installBtn.addEventListener('click', () => {{
+      window.location.href = currentManifest().replace('https://', 'stremio://').replace('http://', 'stremio://');
+    }});
+    refresh();
+  </script>
+</body>
+</html>"""
+
+
 def _find_catalog(catalog_id: str) -> dict:
     catalog = settings.CATALOGS_BY_ID.get(catalog_id)
     if not catalog:
         raise HTTPException(status_code=404, detail="unknown catalog")
     return catalog
+
+
+def _effective_country_filter(catalog_def: dict, config: dict[str, str]) -> str | None:
+    configured_country = _preferred_country_code(config)
+    catalog_country = catalog_def["country_code"]
+    if catalog_country is not None:
+        return catalog_country
+
+    if _catalog_mode(config) == "focused" and configured_country is not None:
+        return configured_country
+
+    return None
 
 
 def get_channels() -> list[CatalogChannel]:
@@ -276,9 +410,13 @@ def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
     return targets
 
 
-def _ordered_live_channels(event: LiveEvent) -> list:
+def _ordered_live_channels(event: LiveEvent, config: dict[str, str]) -> list:
     unique_channels = list({channel.channel_id: channel for channel in event.channels}.values())
-    preferred_country_codes = [code for code in event.country_codes if code != "global"]
+    configured_country = _preferred_country_code(config)
+    if configured_country is not None:
+        preferred_country_codes = [configured_country]
+    else:
+        preferred_country_codes = [code for code in event.country_codes if code != "global"]
 
     def key(channel) -> tuple[int, int, int]:
         cached = 0 if live_channel_stream_cache.get(f"live-channel:{channel.channel_id}") is not None else 1
@@ -448,7 +586,7 @@ def _remember_streams(cache_key: str, factory) -> list[dict]:
     return stream_cache.set(cache_key, streams, ttl_seconds)
 
 
-def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[dict]:
+def _build_channel_streams(channel: CatalogChannel, request: Request, config: dict[str, str]) -> list[dict]:
     def factory() -> list[dict]:
         started_at = perf_counter()
         try:
@@ -490,7 +628,7 @@ def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[di
                         player_type=manifest.player_type,
                     )
                 )
-                if len(streams) >= settings.CHANNEL_STREAM_MAX_RESULTS:
+                if len(streams) >= _channel_stream_result_limit(config):
                     return streams
 
             if streams:
@@ -501,7 +639,10 @@ def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[di
         return streams
 
     return _remember_streams(
-        f"stream:channel:{channel.channel_id}:{_service_base_url(request)}",
+        (
+            f"stream:channel:{channel.channel_id}:{_service_base_url(request)}:"
+            f"{_config_fingerprint(config, ('channelStreamResults',))}"
+        ),
         factory,
     )
 
@@ -569,14 +710,14 @@ def _resolve_live_channel_stream(event: LiveEvent, linked_channel, request: Requ
     )
 
 
-def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
+def _build_live_streams(event: LiveEvent, request: Request, config: dict[str, str]) -> list[dict]:
     def factory() -> list[dict]:
         started_at = perf_counter()
         streams: list[dict] = []
         seen_urls: set[str] = set()
 
         started_at = perf_counter()
-        attempt_channels = _ordered_live_channels(event)[:settings.LIVE_STREAM_MAX_ATTEMPTS]
+        attempt_channels = _ordered_live_channels(event, config)[:settings.LIVE_STREAM_MAX_ATTEMPTS]
         if not attempt_channels:
             return streams
 
@@ -602,7 +743,7 @@ def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
 
                 seen_urls.add(stream["url"])
                 streams.append(stream)
-                if len(streams) >= settings.LIVE_STREAM_MAX_RESULTS:
+                if len(streams) >= _live_stream_result_limit(config):
                     _log_timing("live event stream resolve", started_at, event_id=event.meta_id, streams=len(streams))
                     return streams
                 continue
@@ -625,7 +766,7 @@ def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
 
                     seen_urls.add(stream["url"])
                     streams.append(stream)
-                    if len(streams) >= settings.LIVE_STREAM_MAX_RESULTS:
+                    if len(streams) >= _live_stream_result_limit(config):
                         _log_timing("live event stream resolve", started_at, event_id=event.meta_id, streams=len(streams))
                         return streams
 
@@ -633,7 +774,10 @@ def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
         return streams
 
     return _remember_streams(
-        f"stream:event:{event.meta_id}:{_service_base_url(request)}",
+        (
+            f"stream:event:{event.meta_id}:{_service_base_url(request)}:"
+            f"{_config_fingerprint(config, ('preferredCountryCode', 'liveStreamResults'))}"
+        ),
         factory,
     )
 
@@ -660,7 +804,7 @@ def root() -> RedirectResponse:
 
 @app.get("/configure")
 def configure(request: Request) -> HTMLResponse:
-    return HTMLResponse(_configure_page(request))
+    return HTMLResponse(_configure_page_v2(request))
 
 
 @app.get("/healthz")
@@ -672,7 +816,7 @@ def healthz() -> dict:
 @app.get("/{config}/manifest.json")
 def manifest(request: Request, config: str | None = None) -> JSONResponse:
     user_config = _parse_user_config(config)
-    return JSONResponse(build_manifest(_service_base_url(request), configured=bool(user_config)))
+    return JSONResponse(build_manifest(_service_base_url(request), configured=bool(user_config), user_config=user_config))
 
 
 @app.head("/manifest.json")
@@ -695,7 +839,7 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None, config:
     if catalog_def["kind"] == "channels":
         items = filter_channels(
             get_channels(),
-            country_code=catalog_def["country_code"],
+            country_code=_effective_country_filter(catalog_def, user_config),
             search=search,
             skip=skip,
         )
@@ -703,9 +847,10 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None, config:
     else:
         items = filter_schedule(
             get_schedule(),
-            country_code=catalog_def["country_code"],
+            country_code=_effective_country_filter(catalog_def, user_config),
             search=search,
             skip=skip,
+            stale_after_minutes=_event_stale_after_minutes(user_config),
         )
         metas = [_event_preview(event, request, user_config) for event in items]
 
@@ -779,6 +924,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
 @app.get("/{config}/stream/tv/{meta_id:path}.json")
 def stream(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
+    user_config = _parse_user_config(config)
     if kind == "channel":
         channel = get_cached_channel(value)
         if channel is None:
@@ -792,13 +938,13 @@ def stream(request: Request, meta_id: str, config: str | None = None) -> JSONRes
                 country_code="global",
                 country_label=settings.COUNTRY_LABELS["global"],
             )
-        streams = _build_channel_streams(channel, request)
+        streams = _build_channel_streams(channel, request, user_config)
         return JSONResponse({"streams": streams})
 
     event = _find_event(value)
     if event is None:
         raise HTTPException(status_code=404, detail="event not found")
-    return JSONResponse({"streams": _build_live_streams(event, request)})
+    return JSONResponse({"streams": _build_live_streams(event, request, user_config)})
 
 
 @app.get("/proxy/{filename:path}")

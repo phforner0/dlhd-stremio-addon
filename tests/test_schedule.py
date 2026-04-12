@@ -21,8 +21,8 @@ def test_should_include_event_filters_old_entries(monkeypatch) -> None:
         lambda: datetime(2026, 4, 12, 20, 0, tzinfo=timezone.utc),
     )
 
-    assert schedule_module._should_include_event(datetime(2026, 4, 12, 17, 0, tzinfo=timezone.utc)) is True
-    assert schedule_module._should_include_event(datetime(2026, 4, 12, 13, 59, tzinfo=timezone.utc)) is False
+    assert schedule_module._should_include_event(datetime(2026, 4, 12, 17, 0, tzinfo=timezone.utc), 360) is True
+    assert schedule_module._should_include_event(datetime(2026, 4, 12, 13, 59, tzinfo=timezone.utc), 360) is False
 
 
 def test_display_schedule_values_apply_offset(monkeypatch) -> None:

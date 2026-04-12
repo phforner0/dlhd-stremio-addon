@@ -68,7 +68,7 @@ def test_ordered_live_channels_prefers_event_country_before_cached_global() -> N
         60,
     )
 
-    ordered = _ordered_live_channels(event)
+    ordered = _ordered_live_channels(event, {})
 
     assert [channel.channel_id for channel in ordered] == [88, 138]
     live_channel_stream_cache.delete("live-channel:138")
@@ -181,7 +181,7 @@ def test_build_channel_streams_keeps_addon_name_and_descriptive_label(monkeypatc
     cache_key = f"stream:channel:{channel.channel_id}:http://127.0.0.1:7000"
     stream_cache.delete(cache_key)
 
-    streams = _build_channel_streams(channel, request)
+    streams = _build_channel_streams(channel, request, {})
 
     assert len(streams) == 1
     assert streams[0]["name"] == settings.ADDON_NAME

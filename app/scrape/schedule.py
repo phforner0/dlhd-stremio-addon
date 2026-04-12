@@ -63,10 +63,10 @@ def _parse_schedule_datetime_utc(day_label: str, time_text: str) -> datetime | N
         return None
 
 
-def _should_include_event(scheduled_at_utc: datetime | None) -> bool:
+def _should_include_event(scheduled_at_utc: datetime | None, stale_after_minutes: int) -> bool:
     if scheduled_at_utc is None:
         return True
-    cutoff = _schedule_now_utc() - timedelta(minutes=settings.EVENT_STALE_AFTER_MINUTES)
+    cutoff = _schedule_now_utc() - timedelta(minutes=stale_after_minutes)
     return scheduled_at_utc >= cutoff
 
 
@@ -128,8 +128,6 @@ def scrape_schedule(channel_index: dict[int, CatalogChannel] | None = None) -> l
                     time_node.get_text(" ", strip=True) if time_node else ""
                 )
                 scheduled_at_utc = _parse_schedule_datetime_utc(day_label, raw_time_text)
-                if not _should_include_event(scheduled_at_utc):
-                    continue
                 links: list[ScheduleChannelLink] = []
                 for anchor in event_block.select('.schedule__channels > a[href*="/watch.php?id="]'):
                     href = anchor.get("href") or ""
@@ -185,8 +183,9 @@ def filter_schedule(
     country_code: str | None,
     search: str | None,
     skip: int,
+    stale_after_minutes: int,
 ) -> list[LiveEvent]:
-    items = events
+    items = [event for event in events if _should_include_event(event.scheduled_at_utc, stale_after_minutes)]
     if country_code:
         items = [event for event in items if country_code in event.country_codes]
 
