@@ -5,7 +5,7 @@ import os
 BASE_SITE_URL = os.getenv("DLHD_BASE_URL", "https://dlstreams.top").rstrip("/")
 ADDON_ID = os.getenv("DLHD_ADDON_ID", "com.dlhd.stremio")
 ADDON_NAME = os.getenv("DLHD_ADDON_NAME", "DLHD Streams")
-ADDON_VERSION = os.getenv("DLHD_ADDON_VERSION", "0.1.0")
+ADDON_VERSION = os.getenv("DLHD_ADDON_VERSION", "0.1.1")
 ADDON_DESCRIPTION = os.getenv(
     "DLHD_ADDON_DESCRIPTION",
     "Scraped live channels and schedule grouped by country for Stremio.",

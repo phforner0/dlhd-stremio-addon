@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import quote, unquote
+import re
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 import logging
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from starlette.responses import StreamingResponse
 
 from app import settings
 from app.cache import TTLCache
-from app.http import DEFAULT_HEADERS
+from app.http import DEFAULT_HEADERS, build_session
 from app.manifest import build_manifest
 from app.models import CatalogChannel, LiveEvent, WrapperCatalog
 from app.posters import render_svg_poster
@@ -22,6 +24,7 @@ from app.scrape.watch import fetch_wrapper
 
 app = FastAPI(title=settings.ADDON_NAME, docs_url=None, redoc_url=None)
 LOGGER = logging.getLogger("dlhd.addon")
+HLS_URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 
 app.add_middleware(
     CORSMiddleware,
@@ -142,11 +145,24 @@ def _parse_meta_id(meta_id: str) -> tuple[str, int | str]:
 
 def _manifest_to_stream(
     *,
+    request: Request,
     display_name: str,
     description: str,
     manifest_url: str,
     referer: str,
+    player_type: str,
 ) -> dict:
+    if player_type.lower() == "hls":
+        return {
+            "name": display_name,
+            "description": description,
+            "url": _proxy_media_url(request, manifest_url, referer, filename_hint="stream.m3u8"),
+            "behaviorHints": {
+                "notWebReady": True,
+                "filename": "stream.m3u8",
+            },
+        }
+
     filename = manifest_url.rstrip("/").split("/")[-1] or "stream.m3u8"
     return {
         "name": display_name,
@@ -163,6 +179,65 @@ def _manifest_to_stream(
             },
         },
     }
+
+
+def _proxy_media_url(
+    request: Request,
+    upstream_url: str,
+    referer: str,
+    *,
+    filename_hint: str | None = None,
+) -> str:
+    parsed = urlparse(upstream_url)
+    filename = filename_hint or (parsed.path.rsplit("/", 1)[-1] or "stream.bin")
+    safe_filename = quote(filename, safe="._-")
+    query = urlencode({"url": upstream_url, "referer": referer})
+    return f"{_service_base_url(request)}/proxy/{safe_filename}?{query}"
+
+
+def _rewrite_playlist_line(request: Request, line: str, playlist_url: str, referer: str) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return line
+
+    if stripped.startswith("#"):
+        def repl(match: re.Match[str]) -> str:
+            absolute = urljoin(playlist_url, match.group(1))
+            return f'URI="{_proxy_media_url(request, absolute, referer)}"'
+
+        return HLS_URI_ATTR_RE.sub(repl, line)
+
+    absolute = urljoin(playlist_url, stripped)
+    return _proxy_media_url(request, absolute, referer)
+
+
+def _rewrite_hls_playlist(request: Request, body: str, playlist_url: str, referer: str) -> str:
+    rewritten = [
+        _rewrite_playlist_line(request, line, playlist_url, referer)
+        for line in body.splitlines()
+    ]
+    return "\n".join(rewritten) + ("\n" if body.endswith("\n") else "")
+
+
+def _is_playlist_response(url: str, content_type: str | None) -> bool:
+    lowered_path = urlparse(url).path.lower()
+    lowered_type = (content_type or "").lower()
+    return (
+        lowered_path.endswith(".m3u8")
+        or lowered_path.endswith(".css")
+        or "mpegurl" in lowered_type
+        or lowered_type in {"text/plain", "text/txt"}
+    )
+
+
+def _stream_upstream(upstream, session):
+    try:
+        for chunk in upstream.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                yield chunk
+    finally:
+        upstream.close()
+        session.close()
 
 
 def _default_video(meta_id: str, title: str) -> dict:
@@ -186,7 +261,7 @@ def _remember_streams(cache_key: str, factory) -> list[dict]:
     return stream_cache.set(cache_key, streams, settings.STREAM_CACHE_TTL_SECONDS)
 
 
-def _build_channel_streams(channel: CatalogChannel) -> list[dict]:
+def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[dict]:
     def factory() -> list[dict]:
         try:
             wrapper = get_wrapper(channel.channel_id)
@@ -204,15 +279,20 @@ def _build_channel_streams(channel: CatalogChannel) -> list[dict]:
                 seen_urls.add(manifest.url)
                 streams.append(
                     _manifest_to_stream(
+                        request=request,
                         display_name=settings.ADDON_NAME,
                         description=f"{channel.name} • {channel.country_label} • {resolution.label} • {manifest.player_type.upper()}",
                         manifest_url=manifest.url,
                         referer=manifest.found_at_url,
+                        player_type=manifest.player_type,
                     )
                 )
         return streams
 
-    return _remember_streams(f"stream:channel:{channel.channel_id}", factory)
+    return _remember_streams(
+        f"stream:channel:{channel.channel_id}:{_service_base_url(request)}",
+        factory,
+    )
 
 
 def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
@@ -234,8 +314,7 @@ def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
         )
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning(
-            "Live stream resolution failed for event %s channel %s: %s",
-            event.meta_id,
+            "Live channel resolution failed for channel %s: %s",
             linked_channel.channel_id,
             exc,
         )
@@ -260,12 +339,13 @@ def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
     return None
 
 
-def _resolve_live_channel_stream(event: LiveEvent, linked_channel) -> dict | None:
+def _resolve_live_channel_stream(event: LiveEvent, linked_channel, request: Request) -> dict | None:
     payload = _get_live_channel_payload(linked_channel)
     if not payload:
         return None
 
     return _manifest_to_stream(
+        request=request,
         display_name=settings.ADDON_NAME,
         description=(
             f"{event.title} • {linked_channel.name} • "
@@ -273,10 +353,11 @@ def _resolve_live_channel_stream(event: LiveEvent, linked_channel) -> dict | Non
         ),
         manifest_url=payload["url"],
         referer=payload["referer"],
+        player_type=payload["player_type"],
     )
 
 
-def _build_live_streams(event: LiveEvent) -> list[dict]:
+def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
     def factory() -> list[dict]:
         streams: list[dict] = []
         seen_urls: set[str] = set()
@@ -290,7 +371,10 @@ def _build_live_streams(event: LiveEvent) -> list[dict]:
             batch = attempt_channels[offset:offset + max_workers]
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
-                    (linked_channel, executor.submit(_resolve_live_channel_stream, event, linked_channel))
+                    (
+                        linked_channel,
+                        executor.submit(_resolve_live_channel_stream, event, linked_channel, request),
+                    )
                     for linked_channel in batch
                 ]
 
@@ -308,7 +392,10 @@ def _build_live_streams(event: LiveEvent) -> list[dict]:
 
         return streams
 
-    return _remember_streams(f"stream:event:{event.meta_id}", factory)
+    return _remember_streams(
+        f"stream:event:{event.meta_id}:{_service_base_url(request)}",
+        factory,
+    )
 
 
 def _find_event(meta_id: str) -> LiveEvent | None:
@@ -425,7 +512,7 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
 
 
 @app.get("/stream/tv/{meta_id:path}.json")
-def stream(meta_id: str) -> JSONResponse:
+def stream(request: Request, meta_id: str) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
     if kind == "channel":
         channel = get_channel_index().get(value)
@@ -440,13 +527,61 @@ def stream(meta_id: str) -> JSONResponse:
                 country_code="global",
                 country_label=settings.COUNTRY_LABELS["global"],
             )
-        streams = _build_channel_streams(channel)
+        streams = _build_channel_streams(channel, request)
         return JSONResponse({"streams": streams})
 
     event = _find_event(value)
     if event is None:
         raise HTTPException(status_code=404, detail="event not found")
-    return JSONResponse({"streams": _build_live_streams(event)})
+    return JSONResponse({"streams": _build_live_streams(event, request)})
+
+
+@app.get("/proxy/{filename:path}")
+def proxy_media(
+    request: Request,
+    filename: str,
+    url: str = Query(...),
+    referer: str = Query(...),
+) -> Response:
+    session = build_session()
+    session.headers.update({"Referer": referer})
+
+    range_header = request.headers.get("range")
+    if range_header:
+        session.headers.update({"Range": range_header})
+
+    upstream = session.get(url, timeout=settings.HTTP_TIMEOUT_SECONDS, stream=True, allow_redirects=True)
+    upstream.raise_for_status()
+    content_type = upstream.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
+
+    if _is_playlist_response(upstream.url, content_type):
+        body = upstream.text
+        rewritten = _rewrite_hls_playlist(request, body, upstream.url, referer)
+        upstream.close()
+        session.close()
+        return Response(content=rewritten, media_type="application/vnd.apple.mpegurl")
+
+    response_headers = {}
+    for header_name in ("Accept-Ranges", "Content-Length", "Content-Range"):
+        header_value = upstream.headers.get(header_name)
+        if header_value:
+            response_headers[header_name] = header_value
+
+    if content_type in {"application/javascript", "text/javascript", "text/plain", "text/txt"}:
+        content_type = "application/octet-stream"
+
+    return StreamingResponse(
+        _stream_upstream(upstream, session),
+        status_code=upstream.status_code,
+        media_type=content_type,
+        headers=response_headers,
+    )
+
+
+@app.head("/proxy/{filename:path}")
+def proxy_media_head(filename: str) -> Response:
+    media_type = "application/vnd.apple.mpegurl" if filename.lower().endswith(".m3u8") else "application/octet-stream"
+    return Response(media_type=media_type)
 
 
 @app.get("/assets/logo.svg")
