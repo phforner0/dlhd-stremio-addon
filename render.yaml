@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: dlhd-stremio-addon
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: PORT
+        value: 7000
+      - key: DLHD_BASE_URL
+        value: https://dlstreams.top
+      - key: DLHD_PLAYWRIGHT_MAX_CONCURRENCY
+        value: 4
+      - key: DLHD_LIVE_STREAM_MAX_WORKERS
+        value: 4
+      - key: DLHD_LIVE_STREAM_MAX_RESULTS
+        value: 4
+      - key: DLHD_LIVE_STREAM_MAX_ATTEMPTS
+        value: 6
+      - key: DLHD_CHANNELS_CACHE_TTL
+        value: 43200
+      - key: DLHD_SCHEDULE_CACHE_TTL
+        value: 120
+      - key: DLHD_WATCH_CACHE_TTL
+        value: 1800
+      - key: DLHD_STREAM_CACHE_TTL
+        value: 120
+      - key: DLHD_LIVE_CHANNEL_CACHE_TTL
+        value: 120

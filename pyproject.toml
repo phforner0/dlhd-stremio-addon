@@ -1,0 +1,28 @@
+[project]
+name = "dlhd-stremio-addon"
+version = "0.1.0"
+description = "Standalone Stremio addon for scraped DLHD channels and live schedule"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12,<5",
+    "fastapi>=0.115,<1",
+    "playwright>=1.52,<2",
+    "requests>=2.32,<3",
+    "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
