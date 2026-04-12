@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
+import re
 from time import perf_counter
 from urllib.parse import parse_qs, urlparse
 
@@ -13,6 +15,78 @@ from app.models import CatalogChannel, LiveEvent, ScheduleChannelLink
 from app.normalize.country import classify_channel_country, classify_event_countries
 
 LOGGER = logging.getLogger("dlhd.scrape.schedule")
+
+DAY_LABEL_DATE_RE = re.compile(r"(\d{1,2})(?:st|nd|rd|th)\s+([A-Za-z]+)\s+(\d{4})")
+TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def _schedule_now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_gmt_offset_label(offset_minutes: int) -> str:
+    sign = "+" if offset_minutes >= 0 else "-"
+    absolute = abs(offset_minutes)
+    hours = absolute // 60
+    minutes = absolute % 60
+    return f"GMT {sign}{hours:02d}:{minutes:02d}"
+
+
+def _ordinal(day: int) -> str:
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def _parse_schedule_datetime_utc(day_label: str, time_text: str) -> datetime | None:
+    date_match = DAY_LABEL_DATE_RE.search(day_label)
+    time_match = TIME_RE.match(time_text)
+    if not date_match or not time_match:
+        return None
+
+    day = int(date_match.group(1))
+    month_name = date_match.group(2)
+    year = int(date_match.group(3))
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2))
+
+    try:
+        month = datetime.strptime(month_name, "%B").month
+    except ValueError:
+        return None
+
+    try:
+        return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _should_include_event(scheduled_at_utc: datetime | None) -> bool:
+    if scheduled_at_utc is None:
+        return True
+    cutoff = _schedule_now_utc() - timedelta(minutes=settings.EVENT_STALE_AFTER_MINUTES)
+    return scheduled_at_utc >= cutoff
+
+
+def _display_schedule_values(
+    day_label: str,
+    time_text: str,
+    scheduled_at_utc: datetime | None,
+    offset_minutes: int,
+) -> tuple[str, str]:
+    if scheduled_at_utc is None:
+        return day_label, time_text
+
+    offset = timedelta(minutes=offset_minutes)
+    display_dt = scheduled_at_utc + offset
+    display_day_label = (
+        f"{display_dt.strftime('%A')} {_ordinal(display_dt.day)} "
+        f"{display_dt.strftime('%B %Y')} - Schedule Time {_format_gmt_offset_label(offset_minutes)}"
+    )
+    display_time_text = display_dt.strftime("%H:%M")
+    return display_day_label, display_time_text
 
 
 def _build_event_id(day_label: str, category: str, time_text: str, title: str, channel_ids: list[int]) -> str:
@@ -50,10 +124,12 @@ def scrape_schedule(channel_index: dict[int, CatalogChannel] | None = None) -> l
                 title_node = event_block.select_one(".schedule__eventTitle")
                 time_node = event_block.select_one(".schedule__time")
                 title = title_node.get_text(" ", strip=True) if title_node else "Untitled Event"
-                time_text = (time_node.get("data-time") if time_node else None) or (
+                raw_time_text = (time_node.get("data-time") if time_node else None) or (
                     time_node.get_text(" ", strip=True) if time_node else ""
                 )
-
+                scheduled_at_utc = _parse_schedule_datetime_utc(day_label, raw_time_text)
+                if not _should_include_event(scheduled_at_utc):
+                    continue
                 links: list[ScheduleChannelLink] = []
                 for anchor in event_block.select('.schedule__channels > a[href*="/watch.php?id="]'):
                     href = anchor.get("href") or ""
@@ -87,14 +163,15 @@ def scrape_schedule(channel_index: dict[int, CatalogChannel] | None = None) -> l
                 country_codes = classify_event_countries([link.country_code for link in links])
                 events.append(
                     LiveEvent(
-                        meta_id=_build_event_id(day_label, category, time_text, title, [link.channel_id for link in links]),
+                        meta_id=_build_event_id(day_label, category, raw_time_text, title, [link.channel_id for link in links]),
                         title=title,
-                        time_text=time_text,
+                        time_text=raw_time_text,
                         day_label=day_label,
                         category=category,
                         channels=links,
                         country_codes=country_codes,
                         ordinal=ordinal,
+                        scheduled_at_utc=scheduled_at_utc,
                     )
                 )
 

@@ -244,6 +244,10 @@ The service exposes a few environment variables for tuning live stream resolutio
   Caps how many linked channels are tried for a live event. Default: `6`
 - `DLHD_LIVE_STREAM_BUDGET_SECONDS`
   Caps total live-event resolution time before returning what is already available. Default: `30`
+- `DLHD_SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES`
+  Converts scraped schedule times from UK GMT to a fixed display offset. Default: `0`
+- `DLHD_EVENT_STALE_AFTER_MINUTES`
+  Hides schedule entries older than this many minutes so clearly finished events drop out. Default: `360`
 - `DLHD_STREAM_CACHE_TTL`
   Caches fully built `stream` endpoint responses. Default: `120`
 - `DLHD_LIVE_CHANNEL_CACHE_TTL`
@@ -278,6 +282,8 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_LIVE_STREAM_MAX_RESULTS`: max stream options returned for a large live event. Default: `4`
 - `DLHD_LIVE_STREAM_MAX_ATTEMPTS`: max linked channels attempted for a live event. Default: `6`
 - `DLHD_LIVE_STREAM_BUDGET_SECONDS`: max wall-clock budget for one live event resolution. Default: `30`
+- `DLHD_SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES`: fixed display offset applied to schedule times parsed from UK GMT. Default: `0`
+- `DLHD_EVENT_STALE_AFTER_MINUTES`: hide schedule entries older than this many minutes. Default: `360`
 - `DLHD_CHANNELS_CACHE_TTL`: channel catalog cache TTL. Default: `43200`
 - `DLHD_SCHEDULE_CACHE_TTL`: live schedule cache TTL. Default: `120`
 - `DLHD_WATCH_CACHE_TTL`: `watch.php` metadata cache TTL. Default: `1800`

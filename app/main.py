@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import json
 from time import perf_counter
 import re
 from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
@@ -9,7 +10,7 @@ import logging
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.responses import StreamingResponse
 
 from app import settings
@@ -20,7 +21,7 @@ from app.models import CatalogChannel, LiveEvent, WrapperCatalog
 from app.posters import render_svg_poster
 from app.resolve.player import PlaywrightResolver
 from app.scrape.channels import filter_channels, scrape_channels
-from app.scrape.schedule import filter_schedule, scrape_schedule
+from app.scrape.schedule import _display_schedule_values, filter_schedule, scrape_schedule
 from app.scrape.watch import fetch_wrapper
 
 app = FastAPI(title=settings.ADDON_NAME, docs_url=None, redoc_url=None)
@@ -82,6 +83,101 @@ def _parse_extra(extra: str | None) -> dict[str, str]:
         key, value = segment.split("=", 1)
         parsed[key] = unquote(value)
     return parsed
+
+
+def _parse_user_config(config: str | None) -> dict[str, str]:
+    if not config:
+        return {}
+
+    try:
+        parsed = json.loads(config)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+    if not isinstance(parsed, dict):
+        return {}
+
+    normalized: dict[str, str] = {}
+    for key, value in parsed.items():
+        if isinstance(value, (str, int, float, bool)):
+            normalized[str(key)] = str(value)
+    return normalized
+
+
+def _schedule_offset_minutes(config: dict[str, str]) -> int:
+    raw_value = config.get("scheduleOffsetMin")
+    if raw_value is None:
+        return settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES
+
+    raw_minutes = raw_value.split("|", 1)[0]
+    try:
+        return int(raw_minutes)
+    except ValueError:
+        return settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES
+
+
+def _event_display_values(event: LiveEvent, config: dict[str, str]) -> tuple[str, str]:
+    if event.scheduled_at_utc is None:
+        return event.day_label, event.time_text
+    return _display_schedule_values(event.day_label, event.time_text, event.scheduled_at_utc, _schedule_offset_minutes(config))
+
+
+def _configure_page(request: Request) -> str:
+    default_offset = settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES
+    options = []
+    for minutes in range(-12 * 60, 14 * 60 + 1, 30):
+        sign = "+" if minutes >= 0 else "-"
+        absolute = abs(minutes)
+        hours = absolute // 60
+        mins = absolute % 60
+        selected = " selected" if minutes == default_offset else ""
+        label = f"GMT {sign}{hours:02d}:{mins:02d}"
+        options.append(f'<option value="{minutes}"{selected}>{label}</option>')
+
+    base_url = str(request.base_url).rstrip("/")
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>{settings.ADDON_NAME} Configure</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; background: #111827; color: #fff; }}
+    h1 {{ margin-bottom: 8px; }}
+    p {{ color: #d1d5db; line-height: 1.5; }}
+    label {{ display: block; margin: 24px 0 8px; font-weight: 700; }}
+    select, button {{ width: 100%; padding: 12px; font-size: 16px; border-radius: 8px; border: 1px solid #374151; }}
+    select {{ background: #0f172a; color: #fff; }}
+    button {{ margin-top: 20px; background: #8b5cf6; color: #fff; cursor: pointer; border: 0; }}
+    a {{ color: #93c5fd; }}
+  </style>
+</head>
+<body>
+  <h1>{settings.ADDON_NAME}</h1>
+  <p>Choose the schedule timezone for this installation. Each user can install the addon with a different offset.</p>
+  <label for=\"scheduleOffsetMin\">Schedule Timezone</label>
+  <select id=\"scheduleOffsetMin\">{''.join(options)}</select>
+  <button id=\"installBtn\">Install in Stremio</button>
+  <p id=\"manifestUrl\"></p>
+  <script>
+    const select = document.getElementById('scheduleOffsetMin');
+    const installBtn = document.getElementById('installBtn');
+    const manifestUrl = document.getElementById('manifestUrl');
+    function currentManifest() {{
+      const payload = encodeURIComponent(JSON.stringify({{ scheduleOffsetMin: select.value }}));
+      return `{base_url}/${{payload}}/manifest.json`;
+    }}
+    function refresh() {{
+      manifestUrl.textContent = currentManifest();
+    }}
+    select.addEventListener('change', refresh);
+    installBtn.addEventListener('click', () => {{
+      window.location.href = currentManifest().replace('https://', 'stremio://').replace('http://', 'stremio://');
+    }});
+    refresh();
+  </script>
+</body>
+</html>"""
 
 
 def _find_catalog(catalog_id: str) -> dict:
@@ -213,15 +309,16 @@ def _channel_preview(channel: CatalogChannel, request: Request) -> dict:
     }
 
 
-def _event_preview(event: LiveEvent, request: Request) -> dict:
+def _event_preview(event: LiveEvent, request: Request, config: dict[str, str]) -> dict:
     country_labels = [_country_label(code) for code in event.country_codes]
+    day_label, time_text = _event_display_values(event, config)
     return {
         "id": event.meta_id,
         "type": "tv",
         "name": event.title,
         "poster": _poster_url(request, event.meta_id),
         "posterShape": "poster",
-        "description": f"{event.day_label} • {event.time_text} • {event.category}",
+        "description": f"{day_label} • {time_text} • {event.category}",
         "genres": [event.category, *country_labels],
     }
 
@@ -556,26 +653,42 @@ def _shutdown() -> None:
     close_pooled_sessions()
 
 
+@app.get("/")
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/configure", status_code=307)
+
+
+@app.get("/configure")
+def configure(request: Request) -> HTMLResponse:
+    return HTMLResponse(_configure_page(request))
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"ok": True}
 
 
 @app.get("/manifest.json")
-def manifest(request: Request) -> JSONResponse:
-    return JSONResponse(build_manifest(_service_base_url(request)))
+@app.get("/{config}/manifest.json")
+def manifest(request: Request, config: str | None = None) -> JSONResponse:
+    user_config = _parse_user_config(config)
+    return JSONResponse(build_manifest(_service_base_url(request), configured=bool(user_config)))
 
 
 @app.head("/manifest.json")
-def manifest_head() -> Response:
+@app.head("/{config}/manifest.json")
+def manifest_head(config: str | None = None) -> Response:
     return Response(media_type="application/json")
 
 
 @app.get("/catalog/tv/{catalog_id}.json")
 @app.get("/catalog/tv/{catalog_id}/{extra:path}.json")
-def catalog(request: Request, catalog_id: str, extra: str | None = None) -> JSONResponse:
+@app.get("/{config}/catalog/tv/{catalog_id}.json")
+@app.get("/{config}/catalog/tv/{catalog_id}/{extra:path}.json")
+def catalog(request: Request, catalog_id: str, extra: str | None = None, config: str | None = None) -> JSONResponse:
     catalog_def = _find_catalog(catalog_id)
     extra_props = _parse_extra(extra)
+    user_config = _parse_user_config(config)
     search = extra_props.get("search") or None
     skip = int(extra_props.get("skip", "0") or 0)
 
@@ -594,14 +707,16 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None) -> JSON
             search=search,
             skip=skip,
         )
-        metas = [_event_preview(event, request) for event in items]
+        metas = [_event_preview(event, request, user_config) for event in items]
 
     return JSONResponse({"metas": metas})
 
 
 @app.get("/meta/tv/{meta_id:path}.json")
-def meta(request: Request, meta_id: str) -> JSONResponse:
+@app.get("/{config}/meta/tv/{meta_id:path}.json")
+def meta(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
+    user_config = _parse_user_config(config)
     if kind == "channel":
         channel_id = value
         channel_index = get_channel_index()
@@ -640,6 +755,7 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
     event = _find_event(value)
     if event is None:
         raise HTTPException(status_code=404, detail="event not found")
+    event_day_label, event_time_text = _event_display_values(event, user_config)
 
     meta_payload = {
         "id": event.meta_id,
@@ -649,7 +765,7 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
         "posterShape": "poster",
         "background": _poster_url(request, event.meta_id),
         "description": (
-            f"{event.day_label} • {event.time_text} • {event.category}\n"
+            f"{event_day_label} • {event_time_text} • {event.category}\n"
             f"Channels: {', '.join(channel.name for channel in event.channels)}"
         ),
         "genres": [event.category, *[_country_label(code) for code in event.country_codes]],
@@ -660,7 +776,8 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
 
 
 @app.get("/stream/tv/{meta_id:path}.json")
-def stream(request: Request, meta_id: str) -> JSONResponse:
+@app.get("/{config}/stream/tv/{meta_id:path}.json")
+def stream(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
     if kind == "channel":
         channel = get_cached_channel(value)

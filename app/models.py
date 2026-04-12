@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
 
@@ -122,3 +123,4 @@ class LiveEvent:
     channels: list[ScheduleChannelLink] = field(default_factory=list)
     country_codes: list[str] = field(default_factory=list)
     ordinal: int = 0
+    scheduled_at_utc: datetime | None = None

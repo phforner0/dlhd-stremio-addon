@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from starlette.requests import Request
 
 from app import settings
 from app.main import (
     _build_channel_streams,
+    _event_display_values,
     _looks_like_hls_playlist,
     _ordered_live_channels,
+    _parse_user_config,
     _resolve_live_channel_stream,
     live_channel_stream_cache,
     stream_cache,
@@ -38,6 +41,12 @@ def test_hls_playlist_detection_rejects_non_playlist_text() -> None:
     body = "console.log('not a playlist');"
 
     assert _looks_like_hls_playlist(body) is False
+
+
+def test_parse_user_config_accepts_json_path_segment() -> None:
+    config = _parse_user_config('{"scheduleOffsetMin":"-180"}')
+
+    assert config == {"scheduleOffsetMin": "-180"}
 
 
 def test_ordered_live_channels_prefers_event_country_before_cached_global() -> None:
@@ -102,6 +111,23 @@ def test_resolve_live_channel_stream_keeps_addon_name_and_descriptive_label() ->
     assert "Brazil" in stream["description"]
     assert "Athletico-PR vs Chapecoense" in stream["description"]
     live_channel_stream_cache.delete("live-channel:88")
+
+
+def test_event_display_values_use_user_offset() -> None:
+    event = LiveEvent(
+        meta_id="dlhd:live:test",
+        title="Test Event",
+        time_text="14:00",
+        day_label="Sunday 12th April 2026 - Schedule Time UK GMT",
+        category="Soccer",
+        country_codes=["br"],
+        scheduled_at_utc=datetime(2026, 4, 12, 14, 0, tzinfo=timezone.utc),
+    )
+
+    day_label, time_text = _event_display_values(event, {"scheduleOffsetMin": "-180"})
+
+    assert day_label == "Sunday 12th April 2026 - Schedule Time GMT -03:00"
+    assert time_text == "11:00"
 
 
 def test_build_channel_streams_keeps_addon_name_and_descriptive_label(monkeypatch) -> None:
