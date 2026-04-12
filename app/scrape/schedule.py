@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+from time import perf_counter
 from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
@@ -9,6 +11,8 @@ from app import settings
 from app.http import build_session
 from app.models import CatalogChannel, LiveEvent, ScheduleChannelLink
 from app.normalize.country import classify_channel_country, classify_event_countries
+
+LOGGER = logging.getLogger("dlhd.scrape.schedule")
 
 
 def _build_event_id(day_label: str, category: str, time_text: str, title: str, channel_ids: list[int]) -> str:
@@ -24,6 +28,7 @@ def _build_event_id(day_label: str, category: str, time_text: str, title: str, c
 
 
 def scrape_schedule(channel_index: dict[int, CatalogChannel] | None = None) -> list[LiveEvent]:
+    started_at = perf_counter()
     with build_session() as session:
         response = session.get(settings.BASE_SITE_URL, timeout=settings.HTTP_TIMEOUT_SECONDS)
         response.raise_for_status()
@@ -93,6 +98,7 @@ def scrape_schedule(channel_index: dict[int, CatalogChannel] | None = None) -> l
                     )
                 )
 
+    LOGGER.debug("scrape schedule duration_ms=%s events=%s", round((perf_counter() - started_at) * 1000), len(events))
     return events
 
 

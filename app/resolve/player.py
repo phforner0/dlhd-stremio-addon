@@ -16,6 +16,15 @@ from app.models import ManifestResult, PlayerResolution, WrapperCatalog
 
 LOGGER = logging.getLogger("dlhd.resolve")
 
+
+def _log_timing(message: str, started_at: float, **fields: object) -> None:
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    if details:
+        LOGGER.debug("%s duration_ms=%s %s", message, elapsed_ms, details)
+    else:
+        LOGGER.debug("%s duration_ms=%s", message, elapsed_ms)
+
 MANIFEST_RE: tuple[re.Pattern[str], ...] = (
     re.compile(r'(https?://[^\s\'"<>{}\[\]\\]+\.m3u8(?:[?#][^\s\'"<>]*)?)', re.I),
     re.compile(r'(https?://[^\s\'"<>{}\[\]\\]+\.mpd(?:[?#][^\s\'"<>]*)?)', re.I),
@@ -454,9 +463,76 @@ def _js_eval_streams(frame_or_page: Any, base_url: str) -> list[str]:
 class PlaywrightResolver:
     def __init__(self) -> None:
         self._semaphore = threading.BoundedSemaphore(settings.PLAYWRIGHT_MAX_CONCURRENCY)
+        self._thread_state = threading.local()
+        self._browser_guard = threading.Lock()
+        self._thread_browsers: dict[int, tuple[Any, Any]] = {}
 
     def close(self) -> None:
-        return None
+        with self._browser_guard:
+            browsers = list(self._thread_browsers.values())
+            self._thread_browsers.clear()
+
+        for playwright, browser in browsers:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+    def _drop_thread_browser(self) -> None:
+        thread_id = threading.get_ident()
+        browser = getattr(self._thread_state, "browser", None)
+        playwright = getattr(self._thread_state, "playwright", None)
+
+        self._thread_state.browser = None
+        self._thread_state.playwright = None
+
+        with self._browser_guard:
+            self._thread_browsers.pop(thread_id, None)
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+    def _start_thread_browser(self) -> Any:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise RuntimeError(
+                "Playwright is not installed. Run `pip install playwright` and `playwright install chromium`."
+            ) from exc
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        self._thread_state.playwright = playwright
+        self._thread_state.browser = browser
+
+        with self._browser_guard:
+            self._thread_browsers[threading.get_ident()] = (playwright, browser)
+
+        return browser
+
+    def _get_thread_browser(self) -> Any:
+        browser = getattr(self._thread_state, "browser", None)
+        if browser is not None:
+            try:
+                if browser.is_connected():
+                    return browser
+            except Exception:
+                pass
+            self._drop_thread_browser()
+
+        return self._start_thread_browser()
 
     def resolve_wrapper(
         self,
@@ -488,6 +564,7 @@ class PlaywrightResolver:
         return results
 
     def resolve_player(self, label: str, player_url: str) -> PlayerResolution:
+        started_at = time.perf_counter()
         result = PlayerResolution(label=label, player_page_url=player_url)
         network_hits: list[tuple[str, str]] = []
         network_seen: set[str] = set()
@@ -499,19 +576,42 @@ class PlaywrightResolver:
         try:
             try:
                 from playwright.sync_api import TimeoutError as PWTimeout
-                from playwright.sync_api import sync_playwright
             except ImportError as exc:
                 raise RuntimeError(
                     "Playwright is not installed. Run `pip install playwright` and `playwright install chromium`."
                 ) from exc
 
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
-                context = browser.new_context(
-                    user_agent=DEFAULT_HEADERS["User-Agent"],
-                    locale="pt-BR",
-                    ignore_https_errors=True,
-                )
+            transient_playwright = None
+            transient_browser = None
+            if settings.PLAYWRIGHT_REUSE_BROWSER:
+                browser = self._get_thread_browser()
+            else:
+                from playwright.sync_api import sync_playwright
+
+                transient_playwright = sync_playwright().start()
+                browser = transient_playwright.chromium.launch(headless=True)
+                transient_browser = browser
+
+            try:
+                context = None
+                for attempt in range(2 if settings.PLAYWRIGHT_REUSE_BROWSER else 1):
+                    try:
+                        context = browser.new_context(
+                            user_agent=DEFAULT_HEADERS["User-Agent"],
+                            locale="pt-BR",
+                            ignore_https_errors=True,
+                        )
+                        break
+                    except Exception:
+                        if settings.PLAYWRIGHT_REUSE_BROWSER and attempt == 0:
+                            self._drop_thread_browser()
+                            browser = self._get_thread_browser()
+                            continue
+                        raise
+
+                if context is None:
+                    raise RuntimeError("failed to create browser context")
+
                 page = context.new_page()
                 wait_state = _new_wait_state()
 
@@ -688,6 +788,29 @@ class PlaywrightResolver:
                     iframe_hits=iframe_hits,
                 )
                 result.iframes_seen = iframes_seen
+                _log_timing(
+                    "resolve player",
+                    started_at,
+                    label=label,
+                    manifests=len(result.manifests),
+                    iframes=len(result.iframes_seen),
+                    reused_browser=settings.PLAYWRIGHT_REUSE_BROWSER,
+                )
                 return result
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                if transient_browser is not None:
+                    try:
+                        transient_browser.close()
+                    except Exception:
+                        pass
+                if transient_playwright is not None:
+                    try:
+                        transient_playwright.stop()
+                    except Exception:
+                        pass
         finally:
             self._semaphore.release()

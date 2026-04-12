@@ -226,6 +226,8 @@ The service exposes a few environment variables for tuning live stream resolutio
 
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`
   Limits concurrent Playwright resolutions across requests. Default: `4`
+- `DLHD_PLAYWRIGHT_REUSE_BROWSER`
+  Reuses one Playwright browser per worker thread to reduce cold-start cost. Default: `1`
 - `DLHD_CHANNEL_STREAM_MAX_RESULTS`
   Stops channel resolution after this many working stream options. Default: `2`
 - `DLHD_CHANNEL_STREAM_MAX_ATTEMPTS`
@@ -242,6 +244,10 @@ The service exposes a few environment variables for tuning live stream resolutio
   Caches the first successful live-channel resolution payload so later live events can reuse it. Default: `120`
 - `DLHD_HLS_PLAYLIST_CACHE_TTL`
   Caches rewritten HLS playlists to reduce repeated proxy work. Default: `15`
+- `DLHD_HTTP_POOL_CONNECTIONS`
+  HTTP connection pool size baseline for upstream proxy requests. Default: `32`
+- `DLHD_HTTP_POOL_MAXSIZE`
+  Maximum pooled upstream connections per protocol. Default: `64`
 
 The addon now uses two complementary live caches:
 
@@ -254,7 +260,10 @@ You can override these in `.env` or your deployment platform:
 
 - `PORT`: service listen port inside the container. Default: `7000`
 - `DLHD_BASE_URL`: upstream site base URL. Default: `https://dlstreams.top`
+- `DLHD_HTTP_POOL_CONNECTIONS`: pooled upstream HTTP connection count. Default: `32`
+- `DLHD_HTTP_POOL_MAXSIZE`: pooled upstream HTTP max size. Default: `64`
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`: max simultaneous Playwright resolutions. Default: `4`
+- `DLHD_PLAYWRIGHT_REUSE_BROWSER`: reuse one Playwright browser per worker thread. Default: `1`
 - `DLHD_CHANNEL_STREAM_MAX_RESULTS`: max stream options returned for one channel. Default: `2`
 - `DLHD_CHANNEL_STREAM_MAX_ATTEMPTS`: max player pages attempted for one channel. Default: `3`
 - `DLHD_LIVE_STREAM_MAX_WORKERS`: max parallel linked-channel attempts inside one live request. Default: `4`

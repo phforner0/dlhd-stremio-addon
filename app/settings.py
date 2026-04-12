@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import os
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
 BASE_SITE_URL = os.getenv("DLHD_BASE_URL", "https://dlstreams.top").rstrip("/")
 ADDON_ID = os.getenv("DLHD_ADDON_ID", "com.dlhd.stremio")
 ADDON_NAME = os.getenv("DLHD_ADDON_NAME", "DLHD Streams")
@@ -15,6 +22,7 @@ HTTP_TIMEOUT_SECONDS = int(os.getenv("DLHD_HTTP_TIMEOUT", "20"))
 PLAYWRIGHT_WAIT_SECONDS = int(os.getenv("DLHD_PLAYWRIGHT_WAIT", "6"))
 PLAYWRIGHT_TIMEOUT_MS = int(os.getenv("DLHD_PLAYWRIGHT_TIMEOUT_MS", "20000"))
 PLAYWRIGHT_MAX_CONCURRENCY = int(os.getenv("DLHD_PLAYWRIGHT_MAX_CONCURRENCY", "4"))
+PLAYWRIGHT_REUSE_BROWSER = _env_flag("DLHD_PLAYWRIGHT_REUSE_BROWSER", True)
 CHANNEL_STREAM_MAX_RESULTS = int(os.getenv("DLHD_CHANNEL_STREAM_MAX_RESULTS", "2"))
 CHANNEL_STREAM_MAX_ATTEMPTS = int(os.getenv("DLHD_CHANNEL_STREAM_MAX_ATTEMPTS", "3"))
 LIVE_STREAM_MAX_WORKERS = int(
@@ -31,6 +39,8 @@ STREAM_CACHE_TTL_SECONDS = int(os.getenv("DLHD_STREAM_CACHE_TTL", "120"))
 LIVE_CHANNEL_CACHE_TTL_SECONDS = int(os.getenv("DLHD_LIVE_CHANNEL_CACHE_TTL", "120"))
 FAILED_STREAM_CACHE_TTL_SECONDS = int(os.getenv("DLHD_FAILED_STREAM_CACHE_TTL", "30"))
 HLS_PLAYLIST_CACHE_TTL_SECONDS = int(os.getenv("DLHD_HLS_PLAYLIST_CACHE_TTL", "15"))
+HTTP_POOL_CONNECTIONS = int(os.getenv("DLHD_HTTP_POOL_CONNECTIONS", "32"))
+HTTP_POOL_MAXSIZE = int(os.getenv("DLHD_HTTP_POOL_MAXSIZE", "64"))
 
 COUNTRY_LABELS = {
     "br": "Brazil",

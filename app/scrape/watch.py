@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import re
+from time import perf_counter
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -18,6 +20,8 @@ from app.models import (
     SourceInfo,
     WrapperCatalog,
 )
+
+LOGGER = logging.getLogger("dlhd.scrape.watch")
 
 SELECTORS = {
     "description_meta": 'meta[name="description"]',
@@ -137,9 +141,16 @@ def parse_wrapper(html: str, base_url: str | None = None) -> WrapperCatalog:
 
 
 def fetch_wrapper(channel_id: int) -> WrapperCatalog:
+    started_at = perf_counter()
     url = f"{settings.BASE_SITE_URL}/watch.php?id={channel_id}"
     with build_session() as session:
         response = session.get(url, timeout=settings.HTTP_TIMEOUT_SECONDS, allow_redirects=True)
         response.raise_for_status()
         response.encoding = response.encoding or "utf-8"
-        return parse_wrapper(response.text, response.url)
+        wrapper = parse_wrapper(response.text, response.url)
+        LOGGER.debug(
+            "fetch wrapper duration_ms=%s channel_id=%s",
+            round((perf_counter() - started_at) * 1000),
+            channel_id,
+        )
+        return wrapper

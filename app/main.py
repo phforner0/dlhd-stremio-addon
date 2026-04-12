@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from time import perf_counter
 import re
 from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 import logging
@@ -13,7 +14,7 @@ from starlette.responses import StreamingResponse
 
 from app import settings
 from app.cache import TTLCache
-from app.http import DEFAULT_HEADERS, build_session
+from app.http import DEFAULT_HEADERS, build_session, close_pooled_sessions, get_pooled_session
 from app.manifest import build_manifest
 from app.models import CatalogChannel, LiveEvent, WrapperCatalog
 from app.posters import render_svg_poster
@@ -44,6 +45,15 @@ stream_cache: TTLCache[list[dict]] = TTLCache()
 live_channel_stream_cache: TTLCache[dict[str, str]] = TTLCache()
 playlist_cache: TTLCache[str] = TTLCache()
 resolver = PlaywrightResolver()
+
+
+def _log_timing(message: str, started_at: float, **fields: object) -> None:
+    elapsed_ms = round((perf_counter() - started_at) * 1000)
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    if details:
+        LOGGER.debug("%s duration_ms=%s %s", message, elapsed_ms, details)
+    else:
+        LOGGER.debug("%s duration_ms=%s", message, elapsed_ms)
 
 
 def _service_base_url(request: Request) -> str:
@@ -82,10 +92,11 @@ def _find_catalog(catalog_id: str) -> dict:
 
 
 def get_channels() -> list[CatalogChannel]:
+    started_at = perf_counter()
     return channels_cache.remember(
         "channels",
         settings.CHANNELS_CACHE_TTL_SECONDS,
-        scrape_channels,
+        lambda: _timed_call("channels scrape", scrape_channels, started_at=started_at),
     )
 
 
@@ -105,6 +116,7 @@ def get_cached_channel(channel_id: int) -> CatalogChannel | None:
 
 
 def refresh_schedule() -> list[LiveEvent]:
+    started_at = perf_counter()
     events = scrape_schedule(get_channel_index())
     schedule_cache.set("schedule", events, settings.SCHEDULE_CACHE_TTL_SECONDS)
     schedule_index_cache.set(
@@ -112,6 +124,7 @@ def refresh_schedule() -> list[LiveEvent]:
         {event.meta_id: event for event in events},
         settings.SCHEDULE_CACHE_TTL_SECONDS,
     )
+    _log_timing("schedule refresh", started_at, events=len(events))
     return events
 
 
@@ -132,10 +145,11 @@ def get_schedule_index() -> dict[str, LiveEvent]:
 
 
 def get_wrapper(channel_id: int) -> WrapperCatalog:
+    started_at = perf_counter()
     return watch_cache.remember(
         f"watch:{channel_id}",
         settings.WATCH_CACHE_TTL_SECONDS,
-        lambda: fetch_wrapper(channel_id),
+        lambda: _timed_call("watch fetch", lambda: fetch_wrapper(channel_id), started_at=started_at, channel_id=channel_id),
     )
 
 
@@ -254,14 +268,13 @@ def _rewrite_hls_playlist(request: Request, body: str, playlist_url: str, refere
     return "\n".join(rewritten) + ("\n" if body.endswith("\n") else "")
 
 
-def _stream_upstream(upstream, session):
+def _stream_upstream(upstream):
     try:
         for chunk in upstream.iter_content(chunk_size=256 * 1024):
             if chunk:
                 yield chunk
     finally:
         upstream.close()
-        session.close()
 
 
 def _default_video(meta_id: str, title: str) -> dict:
@@ -271,6 +284,13 @@ def _default_video(meta_id: str, title: str) -> dict:
         "released": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "available": True,
     }
+
+
+def _timed_call(label: str, factory, *, started_at: float | None = None, **fields: object):
+    timing_started_at = perf_counter() if started_at is None else started_at
+    value = factory()
+    _log_timing(label, timing_started_at, **fields)
+    return value
 
 
 def _remember_streams(cache_key: str, factory) -> list[dict]:
@@ -289,6 +309,7 @@ def _remember_streams(cache_key: str, factory) -> list[dict]:
 
 def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[dict]:
     def factory() -> list[dict]:
+        started_at = perf_counter()
         try:
             wrapper = get_wrapper(channel.channel_id)
         except Exception as exc:  # noqa: BLE001
@@ -338,8 +359,10 @@ def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[di
                     return streams
 
             if streams:
+                _log_timing("channel stream resolve", started_at, channel_id=channel.channel_id, streams=len(streams))
                 return streams
 
+        _log_timing("channel stream resolve", started_at, channel_id=channel.channel_id, streams=0)
         return streams
 
     return _remember_streams(
@@ -353,6 +376,8 @@ def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
     cached = live_channel_stream_cache.get(cache_key)
     if cached is not None:
         return cached
+
+    started_at = perf_counter()
 
     try:
         wrapper = get_wrapper(linked_channel.channel_id)
@@ -387,8 +412,10 @@ def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
             payload,
             settings.LIVE_CHANNEL_CACHE_TTL_SECONDS,
         )
+        _log_timing("live channel resolve", started_at, channel_id=linked_channel.channel_id, success=True)
         return payload
 
+    _log_timing("live channel resolve", started_at, channel_id=linked_channel.channel_id, success=False)
     return None
 
 
@@ -412,6 +439,7 @@ def _resolve_live_channel_stream(event: LiveEvent, linked_channel, request: Requ
 
 def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
     def factory() -> list[dict]:
+        started_at = perf_counter()
         streams: list[dict] = []
         seen_urls: set[str] = set()
 
@@ -441,8 +469,10 @@ def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
                     seen_urls.add(stream["url"])
                     streams.append(stream)
                     if len(streams) >= settings.LIVE_STREAM_MAX_RESULTS:
+                        _log_timing("live event stream resolve", started_at, event_id=event.meta_id, streams=len(streams))
                         return streams
 
+        _log_timing("live event stream resolve", started_at, event_id=event.meta_id, streams=len(streams))
         return streams
 
     return _remember_streams(
@@ -463,6 +493,7 @@ def _find_event(meta_id: str) -> LiveEvent | None:
 @app.on_event("shutdown")
 def _shutdown() -> None:
     resolver.close()
+    close_pooled_sessions()
 
 
 @app.get("/healthz")
@@ -600,30 +631,38 @@ def proxy_media(
     url: str = Query(...),
     referer: str = Query(...),
 ) -> Response:
+    started_at = perf_counter()
     playlist_cache_key = None
     if filename.lower().endswith(".m3u8"):
         playlist_cache_key = _playlist_cache_key(url, referer)
         cached_playlist = playlist_cache.get(playlist_cache_key)
         if cached_playlist is not None:
+            _log_timing("proxy playlist cache hit", started_at, filename=filename)
             return Response(content=cached_playlist, media_type="application/vnd.apple.mpegurl")
 
-    session = build_session()
-    session.headers.update({"Referer": referer})
+    session = get_pooled_session()
+    headers = {"Referer": referer}
 
     range_header = request.headers.get("range")
     if range_header:
-        session.headers.update({"Range": range_header})
+        headers["Range"] = range_header
 
-    upstream = session.get(url, timeout=settings.HTTP_TIMEOUT_SECONDS, stream=True, allow_redirects=True)
+    upstream = session.get(
+        url,
+        timeout=settings.HTTP_TIMEOUT_SECONDS,
+        stream=True,
+        allow_redirects=True,
+        headers=headers,
+    )
     upstream.raise_for_status()
     content_type = upstream.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
 
     if playlist_cache_key is not None:
         body = upstream.text
         upstream.close()
-        session.close()
 
         if not _looks_like_hls_playlist(body):
+            _log_timing("proxy non-hls playlist passthrough", started_at, filename=filename)
             return Response(content=body, media_type=content_type or "text/plain")
 
         rewritten = _rewrite_hls_playlist(request, body, upstream.url, referer)
@@ -632,6 +671,7 @@ def proxy_media(
             rewritten,
             settings.HLS_PLAYLIST_CACHE_TTL_SECONDS,
         )
+        _log_timing("proxy playlist rewrite", started_at, filename=filename)
         return Response(content=rewritten, media_type="application/vnd.apple.mpegurl")
 
     response_headers = {}
@@ -644,7 +684,7 @@ def proxy_media(
         content_type = "application/octet-stream"
 
     return StreamingResponse(
-        _stream_upstream(upstream, session),
+        _stream_upstream(upstream),
         status_code=upstream.status_code,
         media_type=content_type,
         headers=response_headers,

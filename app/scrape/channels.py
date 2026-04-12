@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from time import perf_counter
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -9,8 +11,11 @@ from app.http import build_session
 from app.models import CatalogChannel
 from app.normalize.country import classify_channel_country
 
+LOGGER = logging.getLogger("dlhd.scrape.channels")
+
 
 def scrape_channels() -> list[CatalogChannel]:
+    started_at = perf_counter()
     with build_session() as session:
         response = session.get(
             f"{settings.BASE_SITE_URL}/24-7-channels.php",
@@ -47,6 +52,7 @@ def scrape_channels() -> list[CatalogChannel]:
             )
         )
 
+    LOGGER.debug("scrape channels duration_ms=%s channels=%s", round((perf_counter() - started_at) * 1000), len(channels))
     return channels
 
 
