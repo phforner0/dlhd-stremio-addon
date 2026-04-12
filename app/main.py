@@ -485,6 +485,21 @@ def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
                 break
 
             batch = attempt_channels[offset:offset + max_workers]
+            if max_workers == 1:
+                linked_channel = batch[0]
+                stream = _resolve_live_channel_stream(event, linked_channel, request)
+                if not stream:
+                    continue
+                if stream["url"] in seen_urls:
+                    continue
+
+                seen_urls.add(stream["url"])
+                streams.append(stream)
+                if len(streams) >= settings.LIVE_STREAM_MAX_RESULTS:
+                    _log_timing("live event stream resolve", started_at, event_id=event.meta_id, streams=len(streams))
+                    return streams
+                continue
+
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
                     (

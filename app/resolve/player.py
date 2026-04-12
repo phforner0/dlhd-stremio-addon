@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import re
@@ -489,8 +490,19 @@ class PlaywrightResolver:
         self._thread_state = threading.local()
         self._browser_guard = threading.Lock()
         self._thread_browsers: dict[int, dict[str, Any]] = {}
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=settings.PLAYWRIGHT_MAX_CONCURRENCY,
+                thread_name_prefix="playwright-resolver",
+            )
+            if settings.PLAYWRIGHT_REUSE_BROWSER
+            else None
+        )
 
     def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+
         with self._browser_guard:
             browsers = list(self._thread_browsers.values())
             self._thread_browsers.clear()
@@ -613,6 +625,11 @@ class PlaywrightResolver:
         return results
 
     def resolve_player(self, label: str, player_url: str) -> PlayerResolution:
+        if self._executor is not None:
+            return self._executor.submit(self._resolve_player_impl, label, player_url).result()
+        return self._resolve_player_impl(label, player_url)
+
+    def _resolve_player_impl(self, label: str, player_url: str) -> PlayerResolution:
         started_at = time.perf_counter()
         result = PlayerResolution(label=label, player_page_url=player_url)
         network_hits: list[tuple[str, str]] = []
