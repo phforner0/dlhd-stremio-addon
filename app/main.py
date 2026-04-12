@@ -182,10 +182,20 @@ def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
 
 def _ordered_live_channels(event: LiveEvent) -> list:
     unique_channels = list({channel.channel_id: channel for channel in event.channels}.values())
+    preferred_country_codes = [code for code in event.country_codes if code != "global"]
 
     def key(channel) -> tuple[int, int]:
         cached = 0 if live_channel_stream_cache.get(f"live-channel:{channel.channel_id}") is not None else 1
-        country_weight = 0 if channel.country_code != "global" else 1
+        if preferred_country_codes:
+            if channel.country_code in preferred_country_codes:
+                country_weight = 0
+            elif channel.country_code != "global":
+                country_weight = 1
+            else:
+                country_weight = 2
+        else:
+            country_weight = 0 if channel.country_code != "global" else 1
+
         return (cached, country_weight)
 
     return sorted(unique_channels, key=key)
@@ -373,8 +383,8 @@ def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[di
                 streams.append(
                     _manifest_to_stream(
                         request=request,
-                        display_name=settings.ADDON_NAME,
-                        description=f"{channel.name} • {channel.country_label} • {resolution.label} • {manifest.player_type.upper()}",
+                        display_name=f"{channel.name} • {channel.country_label}",
+                        description=f"{resolution.label} • {manifest.player_type.upper()}",
                         manifest_url=manifest.url,
                         referer=manifest.found_at_url,
                         player_type=manifest.player_type,
@@ -451,10 +461,9 @@ def _resolve_live_channel_stream(event: LiveEvent, linked_channel, request: Requ
 
     return _manifest_to_stream(
         request=request,
-        display_name=settings.ADDON_NAME,
+        display_name=f"{linked_channel.name} • {linked_channel.country_label}",
         description=(
-            f"{event.title} • {linked_channel.name} • "
-            f"{linked_channel.country_label} • {payload['player_type']}"
+            f"{event.title} • {payload['player_type']}"
         ),
         manifest_url=payload["url"],
         referer=payload["referer"],
