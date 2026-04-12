@@ -97,6 +97,13 @@ def get_channel_index() -> dict[int, CatalogChannel]:
     )
 
 
+def get_cached_channel(channel_id: int) -> CatalogChannel | None:
+    channel_index = channel_index_cache.get("channels:index")
+    if channel_index is None:
+        return None
+    return channel_index.get(channel_id)
+
+
 def refresh_schedule() -> list[LiveEvent]:
     events = scrape_schedule(get_channel_index())
     schedule_cache.set("schedule", events, settings.SCHEDULE_CACHE_TTL_SECONDS)
@@ -289,9 +296,14 @@ def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[di
             return []
 
         targets: list[tuple[str, str]] = []
+        for alternate in wrapper.player.alternates:
+            if alternate.active:
+                targets.append((alternate.label or "alternate", alternate.url))
         if wrapper.player.primary.url:
             targets.append((wrapper.player.primary.label, wrapper.player.primary.url))
         for alternate in wrapper.player.alternates:
+            if alternate.active:
+                continue
             targets.append((alternate.label or "alternate", alternate.url))
 
         streams: list[dict] = []
@@ -560,7 +572,7 @@ def meta(request: Request, meta_id: str) -> JSONResponse:
 def stream(request: Request, meta_id: str) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
     if kind == "channel":
-        channel = get_channel_index().get(value)
+        channel = get_cached_channel(value)
         if channel is None:
             wrapper = get_wrapper(value)
             channel = CatalogChannel(

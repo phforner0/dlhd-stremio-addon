@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+import time
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
@@ -275,6 +276,71 @@ def _append_unique_hits(target: list[tuple[str, str]], seen: set[str], values: I
             target.append((url, found_at_url))
 
 
+def _has_manifest_hits(*hit_groups: list[tuple[str, str]]) -> bool:
+    return any(hit_groups)
+
+
+def _new_wait_state() -> dict[str, Any]:
+    now = time.monotonic()
+    return {
+        "started_at": now,
+        "last_activity_at": now,
+        "signal_seen": False,
+        "verify_seen": False,
+        "lookup_seen": False,
+        "manifest_seen": False,
+        "frame_seen": False,
+    }
+
+
+def _mark_wait_signal(
+    state: dict[str, Any],
+    *,
+    verify: bool = False,
+    lookup: bool = False,
+    manifest: bool = False,
+    frame: bool = False,
+) -> None:
+    state["signal_seen"] = True
+    state["last_activity_at"] = time.monotonic()
+    if verify:
+        state["verify_seen"] = True
+    if lookup:
+        state["lookup_seen"] = True
+    if manifest:
+        state["manifest_seen"] = True
+    if frame:
+        state["frame_seen"] = True
+
+
+def _wait_for_resolution_window(page: Any, state: dict[str, Any], timeout_ms: int) -> None:
+    quick_wait_ms = min(3500, timeout_ms)
+    quiet_wait_ms = 1000
+    poll_ms = 200
+    quick_deadline = state["started_at"] + (quick_wait_ms / 1000)
+    hard_deadline = state["started_at"] + (timeout_ms / 1000)
+
+    while True:
+        now = time.monotonic()
+        try:
+            if len(page.frames) > 1 and not state["frame_seen"]:
+                _mark_wait_signal(state, frame=True)
+        except Exception:
+            pass
+
+        if state["signal_seen"]:
+            if now - state["last_activity_at"] >= (quiet_wait_ms / 1000):
+                return
+        elif now >= quick_deadline:
+            return
+
+        if now >= hard_deadline:
+            return
+
+        remaining_ms = max(1, int(min(poll_ms, (hard_deadline - now) * 1000)))
+        page.wait_for_timeout(remaining_ms)
+
+
 def _request_found_at_url(request: Any, fallback_url: str, page_url: str | None = None) -> str:
     try:
         frame = request.frame
@@ -400,9 +466,14 @@ class PlaywrightResolver:
         stop_after_first_success: bool = False,
     ) -> list[PlayerResolution]:
         targets: list[tuple[str, str]] = []
+        for alternate in catalog.player.alternates:
+            if alternate.active:
+                targets.append((alternate.label or "alternate", alternate.url))
         if catalog.player.primary.url:
             targets.append((catalog.player.primary.label, catalog.player.primary.url))
         for alternate in catalog.player.alternates:
+            if alternate.active:
+                continue
             targets.append((alternate.label or "alternate", alternate.url))
 
         if not resolve_all and targets:
@@ -442,14 +513,21 @@ class PlaywrightResolver:
                     ignore_https_errors=True,
                 )
                 page = context.new_page()
+                wait_state = _new_wait_state()
 
                 def on_response(response: Any) -> None:
                     url = response.url
                     status = getattr(response, "status", None)
                     if isinstance(status, int) and 200 <= status < 300:
+                        if "/verify" in url:
+                            _mark_wait_signal(wait_state, verify=True)
+                        if "server_lookup" in url:
+                            _mark_wait_signal(wait_state, lookup=True)
+
                         lookup_manifest = _derive_proxy_manifest_from_lookup(response)
                         if lookup_manifest and lookup_manifest not in network_seen:
                             network_seen.add(lookup_manifest)
+                            _mark_wait_signal(wait_state, manifest=True)
                             network_hits.append(
                                 (lookup_manifest, _request_found_at_url(response.request, player_url, page.url or None))
                             )
@@ -461,6 +539,7 @@ class PlaywrightResolver:
                     if url in network_seen:
                         return
                     network_seen.add(url)
+                    _mark_wait_signal(wait_state, manifest=True)
                     network_hits.append((url, _request_found_at_url(response.request, player_url, page.url or None)))
 
                 def on_frame_navigated(frame: Any) -> None:
@@ -468,6 +547,7 @@ class PlaywrightResolver:
                     if src and src != "about:blank" and src not in iframe_seen_set:
                         iframe_seen_set.add(src)
                         iframes_seen.append(src)
+                        _mark_wait_signal(wait_state, frame=True)
 
                 page.on("response", on_response)
                 page.on("framenavigated", on_frame_navigated)
@@ -482,7 +562,7 @@ class PlaywrightResolver:
                     result.error = f"failed to open player: {exc}"
                     return result
 
-                page.wait_for_timeout(settings.PLAYWRIGHT_WAIT_SECONDS * 1000)
+                _wait_for_resolution_window(page, wait_state, settings.PLAYWRIGHT_WAIT_SECONDS * 1000)
 
                 page_url = page.url or player_url
                 dom_hits = _hits(_dom_scan(page, page_url), page_url)
@@ -507,73 +587,98 @@ class PlaywrightResolver:
                         _hits(_extract_embed_proxy_manifest_from_url(frame_url, page_url), frame_url),
                     )
 
+                    if _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
+                        break
+
                 player_host = urlparse(player_url).netloc
-                external_iframes = [
-                    url for url in iframes_seen
-                    if url.startswith("http") and urlparse(url).netloc != player_host and url not in inspected_iframe_urls
-                ]
+                if not _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
+                    external_iframes = [
+                        url for url in iframes_seen
+                        if url.startswith("http") and urlparse(url).netloc != player_host and url not in inspected_iframe_urls
+                    ]
 
-                for ext_url in external_iframes:
-                    ext_net: list[tuple[str, str]] = []
-                    ext_net_seen: set[str] = set()
-                    ext_page = context.new_page()
+                    for ext_url in external_iframes:
+                        ext_net: list[tuple[str, str]] = []
+                        ext_net_seen: set[str] = set()
+                        ext_page = context.new_page()
+                        ext_wait_state = _new_wait_state()
 
-                    def _make_ext_handler(target_hits: list[tuple[str, str]], target_seen: set[str]):
-                        def _handler(response: Any) -> None:
-                            url = response.url
-                            status = getattr(response, "status", None)
-                            if isinstance(status, int) and 200 <= status < 300:
-                                lookup_manifest = _derive_proxy_manifest_from_lookup(response)
-                                if lookup_manifest and lookup_manifest not in target_seen:
-                                    target_seen.add(lookup_manifest)
-                                    target_hits.append(
-                                        (lookup_manifest, _request_found_at_url(response.request, ext_url, ext_page.url or None))
-                                    )
+                        def _make_ext_handler(target_hits: list[tuple[str, str]], target_seen: set[str]):
+                            def _handler(response: Any) -> None:
+                                url = response.url
+                                status = getattr(response, "status", None)
+                                if isinstance(status, int) and 200 <= status < 300:
+                                    if "/verify" in url:
+                                        _mark_wait_signal(ext_wait_state, verify=True)
+                                    if "server_lookup" in url:
+                                        _mark_wait_signal(ext_wait_state, lookup=True)
 
-                            if not _is_manifest(url) or not _is_playlist(url):
-                                return
-                            if not isinstance(status, int) or status < 200 or status >= 300:
-                                return
-                            if url in target_seen:
-                                return
-                            target_seen.add(url)
-                            target_hits.append((url, _request_found_at_url(response.request, ext_url, ext_page.url or None)))
+                                    lookup_manifest = _derive_proxy_manifest_from_lookup(response)
+                                    if lookup_manifest and lookup_manifest not in target_seen:
+                                        target_seen.add(lookup_manifest)
+                                        _mark_wait_signal(ext_wait_state, manifest=True)
+                                        target_hits.append(
+                                            (lookup_manifest, _request_found_at_url(response.request, ext_url, ext_page.url or None))
+                                        )
 
-                        return _handler
+                                if not _is_manifest(url) or not _is_playlist(url):
+                                    return
+                                if not isinstance(status, int) or status < 200 or status >= 300:
+                                    return
+                                if url in target_seen:
+                                    return
+                                target_seen.add(url)
+                                _mark_wait_signal(ext_wait_state, manifest=True)
+                                target_hits.append((url, _request_found_at_url(response.request, ext_url, ext_page.url or None)))
 
-                    ext_page.on("response", _make_ext_handler(ext_net, ext_net_seen))
-                    try:
-                        ext_page.goto(ext_url, timeout=settings.PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded")
-                        ext_page.wait_for_timeout(settings.PLAYWRIGHT_WAIT_SECONDS * 1000)
-                        ext_final = ext_page.url or ext_url
-                        inspected_iframe_urls.add(ext_url)
-                        inspected_iframe_urls.add(ext_final)
+                            return _handler
 
-                        _append_unique_hits(iframe_hits, iframe_seen_manifest_set, ext_net)
-                        _append_unique_hits(iframe_hits, iframe_seen_manifest_set, _hits(_dom_scan(ext_page, ext_final), ext_final))
-                        _append_unique_hits(iframe_hits, iframe_seen_manifest_set, _hits(_js_eval_streams(ext_page, ext_final), ext_final))
-                        _append_unique_hits(
-                            iframe_hits,
-                            iframe_seen_manifest_set,
-                            _hits(_extract_embed_proxy_manifest_from_url(ext_final, page_url), ext_final),
-                        )
+                        def _on_ext_frame_navigated(frame: Any) -> None:
+                            src = frame.url
+                            if src and src != "about:blank":
+                                _mark_wait_signal(ext_wait_state, frame=True)
 
-                        for sub_frame in ext_page.frames[1:]:
-                            sub_url = sub_frame.url
-                            if not sub_url or sub_url == "about:blank":
-                                continue
-                            inspected_iframe_urls.add(sub_url)
-                            _append_unique_hits(iframe_hits, iframe_seen_manifest_set, _hits(_dom_scan(sub_frame, sub_url), sub_url))
-                            _append_unique_hits(iframe_hits, iframe_seen_manifest_set, _hits(_js_eval_streams(sub_frame, sub_url), sub_url))
+                        ext_page.on("response", _make_ext_handler(ext_net, ext_net_seen))
+                        ext_page.on("framenavigated", _on_ext_frame_navigated)
+                        try:
+                            ext_page.goto(ext_url, timeout=settings.PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded")
+                            _wait_for_resolution_window(ext_page, ext_wait_state, settings.PLAYWRIGHT_WAIT_SECONDS * 1000)
+                            ext_final = ext_page.url or ext_url
+                            inspected_iframe_urls.add(ext_url)
+                            inspected_iframe_urls.add(ext_final)
+
+                            _append_unique_hits(iframe_hits, iframe_seen_manifest_set, ext_net)
+                            _append_unique_hits(iframe_hits, iframe_seen_manifest_set, _hits(_dom_scan(ext_page, ext_final), ext_final))
+                            _append_unique_hits(iframe_hits, iframe_seen_manifest_set, _hits(_js_eval_streams(ext_page, ext_final), ext_final))
                             _append_unique_hits(
                                 iframe_hits,
                                 iframe_seen_manifest_set,
-                                _hits(_extract_embed_proxy_manifest_from_url(sub_url, page_url), sub_url),
+                                _hits(_extract_embed_proxy_manifest_from_url(ext_final, page_url), ext_final),
                             )
-                    except Exception as exc:  # noqa: BLE001
-                        LOGGER.debug("External iframe resolution failed for %s: %s", ext_url, exc)
-                    finally:
-                        ext_page.close()
+
+                            if not _has_manifest_hits(iframe_hits):
+                                for sub_frame in ext_page.frames[1:]:
+                                    sub_url = sub_frame.url
+                                    if not sub_url or sub_url == "about:blank":
+                                        continue
+                                    inspected_iframe_urls.add(sub_url)
+                                    _append_unique_hits(iframe_hits, iframe_seen_manifest_set, _hits(_dom_scan(sub_frame, sub_url), sub_url))
+                                    _append_unique_hits(iframe_hits, iframe_seen_manifest_set, _hits(_js_eval_streams(sub_frame, sub_url), sub_url))
+                                    _append_unique_hits(
+                                        iframe_hits,
+                                        iframe_seen_manifest_set,
+                                        _hits(_extract_embed_proxy_manifest_from_url(sub_url, page_url), sub_url),
+                                    )
+
+                                    if _has_manifest_hits(iframe_hits):
+                                        break
+                        except Exception as exc:  # noqa: BLE001
+                            LOGGER.debug("External iframe resolution failed for %s: %s", ext_url, exc)
+                        finally:
+                            ext_page.close()
+
+                        if _has_manifest_hits(iframe_hits):
+                            break
 
                 _populate_manifest_results(
                     result=result,
