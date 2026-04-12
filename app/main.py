@@ -5,6 +5,7 @@ from urllib.parse import quote, unquote
 import logging
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from app import settings
@@ -20,6 +21,15 @@ from app.scrape.watch import fetch_wrapper
 
 app = FastAPI(title=settings.ADDON_NAME, docs_url=None, redoc_url=None)
 LOGGER = logging.getLogger("dlhd.addon")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "HEAD", "OPTIONS"],
+    allow_headers=["*"],
+    max_age=86400,
+)
 
 channels_cache: TTLCache[list[CatalogChannel]] = TTLCache()
 schedule_cache: TTLCache[list[LiveEvent]] = TTLCache()
@@ -314,6 +324,11 @@ def healthz() -> dict:
 @app.get("/manifest.json")
 def manifest(request: Request) -> JSONResponse:
     return JSONResponse(build_manifest(_service_base_url(request)))
+
+
+@app.head("/manifest.json")
+def manifest_head() -> Response:
+    return Response(media_type="application/json")
 
 
 @app.get("/catalog/tv/{catalog_id}.json")
