@@ -1,5 +1,8 @@
 # DLHD Stremio Addon
 
+[![CI](https://github.com/phforner0/dlhd-stremio-addon/actions/workflows/ci.yml/badge.svg)](https://github.com/phforner0/dlhd-stremio-addon/actions/workflows/ci.yml)
+[![Smoke](https://github.com/phforner0/dlhd-stremio-addon/actions/workflows/smoke.yml/badge.svg)](https://github.com/phforner0/dlhd-stremio-addon/actions/workflows/smoke.yml)
+
 Standalone Stremio addon service that scrapes the public DLHD site and exposes:
 
 - All Channels
@@ -78,6 +81,7 @@ http://localhost:7000/manifest.json
 - Railway quickstart with automatic domain: [`deploy/railway/QUICKSTART_AUTOMATIC_DOMAIN.md`](deploy/railway/QUICKSTART_AUTOMATIC_DOMAIN.md)
 - Railway production checklist: [`deploy/railway/PRODUCTION_CHECKLIST.md`](deploy/railway/PRODUCTION_CHECKLIST.md)
 - Render: [`deploy/render/README.md`](deploy/render/README.md)
+- Release checklist: [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md)
 - VPS Ubuntu stack: [`deploy/vps/README.md`](deploy/vps/README.md)
 - VPS production checklist: [`deploy/vps/PRODUCTION_CHECKLIST.md`](deploy/vps/PRODUCTION_CHECKLIST.md)
 - Standalone repo move guide: [`STANDALONE_REPO.md`](STANDALONE_REPO.md)
@@ -108,6 +112,20 @@ Recommended first setup:
 2. optionally add `SMOKE_CHANNEL_ID`
 3. run `Smoke` manually once
 4. keep the scheduled smoke workflow enabled for production monitoring
+
+## Release Flow
+
+Recommended release order:
+
+1. bump the addon version in `app/settings.py`
+2. keep `pyproject.toml` aligned with the same version
+3. update example env files if they pin `DLHD_ADDON_VERSION`
+4. merge to `main` and wait for `CI`
+5. run `Smoke` manually against the public deploy
+6. redeploy Railway if needed and verify `/manifest.json`
+7. create a tag/release only after playback is confirmed in Stremio
+
+Use the detailed checklist in [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md).
 
 ## Public HTTPS Deployment
 
