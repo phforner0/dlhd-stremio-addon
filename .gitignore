@@ -3,11 +3,13 @@
 .env.local
 .env.production
 .venv/
+*.egg-info/
 __pycache__/
 .pytest_cache/
 *.pyc
 *.pyo
 *.pyd
 *.log
+dlhd-stremio-addon/
 deploy/vps/.env
 deploy/vps/.env.production
