@@ -6,6 +6,7 @@ from starlette.requests import Request
 from app import settings
 from app.main import (
     _build_channel_streams,
+    _encode_user_config,
     _event_display_values,
     _looks_like_hls_playlist,
     _ordered_live_channels,
@@ -47,6 +48,14 @@ def test_parse_user_config_accepts_json_path_segment() -> None:
     config = _parse_user_config('{"scheduleOffsetMin":"-180"}')
 
     assert config == {"scheduleOffsetMin": "-180"}
+
+
+def test_parse_user_config_accepts_base64url_token() -> None:
+    token = _encode_user_config({"scheduleOffsetMin": "-180", "catalogMode": "focused"})
+
+    config = _parse_user_config(token)
+
+    assert config == {"scheduleOffsetMin": "-180", "catalogMode": "focused"}
 
 
 def test_ordered_live_channels_prefers_event_country_before_cached_global() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
@@ -89,6 +90,9 @@ def _parse_user_config(config: str | None) -> dict[str, str]:
     if not config:
         return {}
 
+    if config.startswith("cfg-"):
+        return _decode_user_config_token(config)
+
     try:
         parsed = json.loads(config)
     except (json.JSONDecodeError, TypeError):
@@ -102,6 +106,21 @@ def _parse_user_config(config: str | None) -> dict[str, str]:
         if isinstance(value, (str, int, float, bool)):
             normalized[str(key)] = str(value)
     return normalized
+
+
+def _decode_user_config_token(config: str) -> dict[str, str]:
+    token = config.removeprefix("cfg-")
+    padding = "=" * (-len(token) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(token + padding).decode("utf-8")
+    except Exception:
+        return {}
+    return _parse_user_config(decoded)
+
+
+def _encode_user_config(config: dict[str, str]) -> str:
+    raw = json.dumps(config, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return "cfg-" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
 def _schedule_offset_minutes(config: dict[str, str]) -> int:
@@ -284,9 +303,16 @@ def _configure_page_v2(request: Request) -> str:
       .map((id) => document.getElementById(id));
     const installBtn = document.getElementById('installBtn');
     const manifestUrl = document.getElementById('manifestUrl');
+    function encodeConfig(config) {{
+      const json = JSON.stringify(config);
+      return 'cfg-' + btoa(unescape(encodeURIComponent(json)))
+        .replace(/[+]/g, '-')
+        .replace(/[\/]/g, '_')
+        .replace(/=+$/g, '');
+    }}
     function currentManifest() {{
       const config = Object.fromEntries(fields.map((field) => [field.id, field.value]));
-      const payload = encodeURIComponent(JSON.stringify(config));
+      const payload = encodeConfig(config);
       return `{base_url}/${{payload}}/manifest.json`;
     }}
     function refresh() {{
