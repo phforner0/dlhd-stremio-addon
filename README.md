@@ -238,6 +238,8 @@ The service exposes a few environment variables for tuning live stream resolutio
   Stops large live-event resolution after this many working streams. Default: `4`
 - `DLHD_LIVE_STREAM_MAX_ATTEMPTS`
   Caps how many linked channels are tried for a live event. Default: `6`
+- `DLHD_LIVE_STREAM_BUDGET_SECONDS`
+  Caps total live-event resolution time before returning what is already available. Default: `30`
 - `DLHD_STREAM_CACHE_TTL`
   Caches fully built `stream` endpoint responses. Default: `120`
 - `DLHD_LIVE_CHANNEL_CACHE_TTL`
@@ -269,6 +271,7 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_LIVE_STREAM_MAX_WORKERS`: max parallel linked-channel attempts inside one live request. Default: `4`
 - `DLHD_LIVE_STREAM_MAX_RESULTS`: max stream options returned for a large live event. Default: `4`
 - `DLHD_LIVE_STREAM_MAX_ATTEMPTS`: max linked channels attempted for a live event. Default: `6`
+- `DLHD_LIVE_STREAM_BUDGET_SECONDS`: max wall-clock budget for one live event resolution. Default: `30`
 - `DLHD_CHANNELS_CACHE_TTL`: channel catalog cache TTL. Default: `43200`
 - `DLHD_SCHEDULE_CACHE_TTL`: live schedule cache TTL. Default: `120`
 - `DLHD_WATCH_CACHE_TTL`: `watch.php` metadata cache TTL. Default: `1800`

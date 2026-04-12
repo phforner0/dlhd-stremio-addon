@@ -157,6 +157,40 @@ def _country_label(country_code: str) -> str:
     return settings.COUNTRY_LABELS[country_code]
 
 
+def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
+    targets: list[tuple[str, str]] = []
+    seen_urls: set[str] = set()
+
+    for alternate in wrapper.player.alternates:
+        if not alternate.active or alternate.url in seen_urls:
+            continue
+        seen_urls.add(alternate.url)
+        targets.append((alternate.label or "alternate", alternate.url))
+
+    if wrapper.player.primary.url and wrapper.player.primary.url not in seen_urls:
+        seen_urls.add(wrapper.player.primary.url)
+        targets.append((wrapper.player.primary.label, wrapper.player.primary.url))
+
+    for alternate in wrapper.player.alternates:
+        if alternate.active or alternate.url in seen_urls:
+            continue
+        seen_urls.add(alternate.url)
+        targets.append((alternate.label or "alternate", alternate.url))
+
+    return targets
+
+
+def _ordered_live_channels(event: LiveEvent) -> list:
+    unique_channels = list({channel.channel_id: channel for channel in event.channels}.values())
+
+    def key(channel) -> tuple[int, int]:
+        cached = 0 if live_channel_stream_cache.get(f"live-channel:{channel.channel_id}") is not None else 1
+        country_weight = 0 if channel.country_code != "global" else 1
+        return (cached, country_weight)
+
+    return sorted(unique_channels, key=key)
+
+
 def _channel_preview(channel: CatalogChannel, request: Request) -> dict:
     return {
         "id": channel.meta_id,
@@ -316,16 +350,7 @@ def _build_channel_streams(channel: CatalogChannel, request: Request) -> list[di
             LOGGER.warning("Channel stream resolution failed for %s: %s", channel.channel_id, exc)
             return []
 
-        targets: list[tuple[str, str]] = []
-        for alternate in wrapper.player.alternates:
-            if alternate.active:
-                targets.append((alternate.label or "alternate", alternate.url))
-        if wrapper.player.primary.url:
-            targets.append((wrapper.player.primary.label, wrapper.player.primary.url))
-        for alternate in wrapper.player.alternates:
-            if alternate.active:
-                continue
-            targets.append((alternate.label or "alternate", alternate.url))
+        targets = _ordered_player_targets(wrapper)
 
         streams: list[dict] = []
         seen_urls: set[str] = set()
@@ -443,12 +468,22 @@ def _build_live_streams(event: LiveEvent, request: Request) -> list[dict]:
         streams: list[dict] = []
         seen_urls: set[str] = set()
 
-        attempt_channels = event.channels[:settings.LIVE_STREAM_MAX_ATTEMPTS]
+        started_at = perf_counter()
+        attempt_channels = _ordered_live_channels(event)[:settings.LIVE_STREAM_MAX_ATTEMPTS]
         if not attempt_channels:
             return streams
 
         max_workers = max(1, min(settings.LIVE_STREAM_MAX_WORKERS, len(attempt_channels)))
         for offset in range(0, len(attempt_channels), max_workers):
+            if perf_counter() - started_at >= settings.LIVE_STREAM_BUDGET_SECONDS:
+                _log_timing(
+                    "live event budget exhausted",
+                    started_at,
+                    event_id=event.meta_id,
+                    streams=len(streams),
+                )
+                break
+
             batch = attempt_channels[offset:offset + max_workers]
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [

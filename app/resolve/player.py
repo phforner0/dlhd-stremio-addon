@@ -302,6 +302,29 @@ def _new_wait_state() -> dict[str, Any]:
     }
 
 
+def _ordered_player_targets(catalog: WrapperCatalog) -> list[tuple[str, str]]:
+    targets: list[tuple[str, str]] = []
+    seen_urls: set[str] = set()
+
+    for alternate in catalog.player.alternates:
+        if not alternate.active or alternate.url in seen_urls:
+            continue
+        seen_urls.add(alternate.url)
+        targets.append((alternate.label or "alternate", alternate.url))
+
+    if catalog.player.primary.url and catalog.player.primary.url not in seen_urls:
+        seen_urls.add(catalog.player.primary.url)
+        targets.append((catalog.player.primary.label, catalog.player.primary.url))
+
+    for alternate in catalog.player.alternates:
+        if alternate.active or alternate.url in seen_urls:
+            continue
+        seen_urls.add(alternate.url)
+        targets.append((alternate.label or "alternate", alternate.url))
+
+    return targets
+
+
 def _mark_wait_signal(
     state: dict[str, Any],
     *,
@@ -541,16 +564,7 @@ class PlaywrightResolver:
         resolve_all: bool,
         stop_after_first_success: bool = False,
     ) -> list[PlayerResolution]:
-        targets: list[tuple[str, str]] = []
-        for alternate in catalog.player.alternates:
-            if alternate.active:
-                targets.append((alternate.label or "alternate", alternate.url))
-        if catalog.player.primary.url:
-            targets.append((catalog.player.primary.label, catalog.player.primary.url))
-        for alternate in catalog.player.alternates:
-            if alternate.active:
-                continue
-            targets.append((alternate.label or "alternate", alternate.url))
+        targets = _ordered_player_targets(catalog)
 
         if not resolve_all and targets:
             targets = targets[:1]
