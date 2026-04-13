@@ -26,3 +26,21 @@ def test_manifest_hides_config_after_configuration() -> None:
 
     assert "config" not in manifest
     assert "configurable" not in manifest["behaviorHints"]
+
+
+def test_focused_manifest_keeps_all_catalogs_present() -> None:
+    manifest = build_manifest(
+        "https://example.test",
+        configured=True,
+        user_config={"catalogMode": "focused", "preferredCountryCode": "br"},
+    )
+
+    ids = [catalog["id"] for catalog in manifest["catalogs"]]
+    assert ids == [
+        "channels_all",
+        "live_all",
+        "channels_br",
+        "live_br",
+        "channels_global",
+        "live_global",
+    ]

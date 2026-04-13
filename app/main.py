@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import base64
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import ipaddress
 import json
 from time import perf_counter
 import re
 from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 import logging
+import socket
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,9 +25,19 @@ from app.posters import render_svg_poster
 from app.resolve.player import PlaywrightResolver
 from app.scrape.channels import filter_channels, scrape_channels
 from app.scrape.schedule import _display_schedule_values, filter_schedule, scrape_schedule
-from app.scrape.watch import fetch_wrapper
+from app.scrape.watch import WatchFetchError, fetch_wrapper
 
-app = FastAPI(title=settings.ADDON_NAME, docs_url=None, redoc_url=None)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        resolver.close()
+        close_pooled_sessions()
+
+
+app = FastAPI(title=settings.ADDON_NAME, docs_url=None, redoc_url=None, lifespan=lifespan)
 LOGGER = logging.getLogger("dlhd.addon")
 HLS_URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 
@@ -38,14 +50,14 @@ app.add_middleware(
     max_age=86400,
 )
 
-channels_cache: TTLCache[list[CatalogChannel]] = TTLCache()
-channel_index_cache: TTLCache[dict[int, CatalogChannel]] = TTLCache()
-schedule_cache: TTLCache[list[LiveEvent]] = TTLCache()
-schedule_index_cache: TTLCache[dict[str, LiveEvent]] = TTLCache()
-watch_cache: TTLCache[WrapperCatalog] = TTLCache()
-stream_cache: TTLCache[list[dict]] = TTLCache()
-live_channel_stream_cache: TTLCache[dict[str, str]] = TTLCache()
-playlist_cache: TTLCache[str] = TTLCache()
+channels_cache: TTLCache[list[CatalogChannel]] = TTLCache(max_entries=settings.CHANNELS_CACHE_MAX_ENTRIES)
+channel_index_cache: TTLCache[dict[int, CatalogChannel]] = TTLCache(max_entries=settings.CHANNEL_INDEX_CACHE_MAX_ENTRIES)
+schedule_cache: TTLCache[list[LiveEvent]] = TTLCache(max_entries=settings.SCHEDULE_CACHE_MAX_ENTRIES)
+schedule_index_cache: TTLCache[dict[str, LiveEvent]] = TTLCache(max_entries=settings.SCHEDULE_INDEX_CACHE_MAX_ENTRIES)
+watch_cache: TTLCache[WrapperCatalog] = TTLCache(max_entries=settings.WATCH_CACHE_MAX_ENTRIES)
+stream_cache: TTLCache[list[dict]] = TTLCache(max_entries=settings.STREAM_CACHE_MAX_ENTRIES)
+live_channel_stream_cache: TTLCache[dict[str, str]] = TTLCache(max_entries=settings.LIVE_CHANNEL_CACHE_MAX_ENTRIES)
+playlist_cache: TTLCache[str] = TTLCache(max_entries=settings.HLS_PLAYLIST_CACHE_MAX_ENTRIES)
 resolver = PlaywrightResolver()
 
 
@@ -62,8 +74,75 @@ def _service_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
-def _playlist_cache_key(url: str, referer: str) -> str:
-    return f"playlist:{url}|{referer}"
+def _playlist_cache_key(base_url: str, url: str, referer: str) -> str:
+    return f"playlist:{base_url}|{url}|{referer}"
+
+
+def _host_allowed(host: str) -> bool:
+    lowered = host.lower()
+    for allowed in settings.PROXY_ALLOWED_HOSTS:
+        if allowed.startswith("."):
+            if lowered == allowed[1:] or lowered.endswith(allowed):
+                return True
+        elif lowered == allowed:
+            return True
+    return False
+
+
+def _public_host(host: str) -> bool:
+    try:
+        resolved = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+
+    for entry in resolved:
+        ip = entry[4][0]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+            or addr.is_unspecified
+        ):
+            return False
+    return True
+
+
+def _validate_proxy_url(raw_url: str, field_name: str) -> str:
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail=f"invalid {field_name} scheme")
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail=f"invalid {field_name} host")
+    if not _host_allowed(parsed.hostname):
+        raise HTTPException(status_code=403, detail=f"disallowed {field_name} host")
+    if not _public_host(parsed.hostname):
+        raise HTTPException(status_code=403, detail=f"disallowed {field_name} address")
+    return raw_url
+
+
+def _parse_skip(raw_skip: str | None) -> int:
+    if raw_skip is None or raw_skip == "":
+        return 0
+    try:
+        parsed = int(raw_skip)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid skip") from exc
+    return max(parsed, 0)
+
+
+def _wrapper_or_http_error(channel_id: int) -> WrapperCatalog:
+    try:
+        return get_wrapper(channel_id)
+    except WatchFetchError as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"channel {channel_id} not found") from exc
+        raise HTTPException(status_code=502, detail=f"failed to fetch channel {channel_id}") from exc
 
 
 def _looks_like_hls_playlist(body: str) -> bool:
@@ -189,70 +268,6 @@ def _configure_page(request: Request) -> str:
     return _configure_page_v2(request)
 
 
-def _configure_page_legacy(request: Request) -> str:
-    return _configure_page_v2(request)
-
-    default_offset = settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES
-    options = []
-    for minutes in range(-12 * 60, 14 * 60 + 1, 30):
-        sign = "+" if minutes >= 0 else "-"
-        absolute = abs(minutes)
-        hours = absolute // 60
-        mins = absolute % 60
-        selected = " selected" if minutes == default_offset else ""
-        label = f"GMT {sign}{hours:02d}:{mins:02d}"
-        options.append(f'<option value="{minutes}"{selected}>{label}</option>')
-
-    base_url = str(request.base_url).rstrip("/")
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>{settings.ADDON_NAME} Configure</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; background: #111827; color: #fff; }}
-    h1 {{ margin-bottom: 8px; }}
-    p {{ color: #d1d5db; line-height: 1.5; }}
-    label {{ display: block; margin: 24px 0 8px; font-weight: 700; }}
-    select, button {{ width: 100%; padding: 12px; font-size: 16px; border-radius: 8px; border: 1px solid #374151; }}
-    select {{ background: #0f172a; color: #fff; }}
-    button {{ margin-top: 20px; background: #8b5cf6; color: #fff; cursor: pointer; border: 0; }}
-    button.secondary {{ background: #1f2937; }}
-    a {{ color: #93c5fd; }}
-    code {{ display: block; margin-top: 12px; padding: 12px; background: #0f172a; border-radius: 8px; color: #e5e7eb; word-break: break-all; }}
-    .help {{ margin-top: 12px; font-size: 14px; }}
-  </style>
-</head>
-<body>
-  <h1>{settings.ADDON_NAME}</h1>
-  <p>Choose the schedule timezone for this installation. Each user can install the addon with a different offset.</p>
-  <label for=\"scheduleOffsetMin\">Schedule Timezone</label>
-  <select id=\"scheduleOffsetMin\">{''.join(options)}</select>
-  <button id=\"installBtn\">Install in Stremio</button>
-  <button id=\"copyBtn\" class=\"secondary\" type=\"button\">Copy manifest URL</button>
-  <p class=\"help\">If the install button opens a page-not-found screen, copy the manifest URL below and paste it manually inside Stremio.</p>
-  <code id=\"manifestUrl\"></code>
-  <script>
-    const select = document.getElementById('scheduleOffsetMin');
-    const installBtn = document.getElementById('installBtn');
-    const copyBtn = document.getElementById('copyBtn');
-    const manifestUrl = document.getElementById('manifestUrl');
-    function currentManifest() {{
-      const payload = encodeURIComponent(JSON.stringify({{ scheduleOffsetMin: select.value }}));
-      return `{base_url}/${{payload}}/manifest.json`;
-    }}
-    function refresh() {{
-      manifestUrl.textContent = currentManifest();
-    }}
-    select.addEventListener('change', refresh);
-    installBtn.addEventListener('click', () => {{
-      window.location.href = currentManifest().replace('https://', 'stremio://').replace('http://', 'stremio://');
-    }});
-    refresh();
-  </script>
-</body>
-</html>"""
 
 
 def _configure_page_v2(request: Request) -> str:
@@ -325,7 +340,7 @@ def _configure_page_v2(request: Request) -> str:
       const json = JSON.stringify(config);
       return 'cfg-' + btoa(unescape(encodeURIComponent(json)))
         .replace(/[+]/g, '-')
-        .replace(/[\/]/g, '_')
+        .split('/').join('_')
         .replace(/=+$/g, '');
     }}
     function currentManifest() {{
@@ -375,9 +390,10 @@ def _effective_country_filter(catalog_def: dict, config: dict[str, str]) -> str 
 
 def get_channels() -> list[CatalogChannel]:
     started_at = perf_counter()
-    return channels_cache.remember(
+    return channels_cache.remember_stale(
         "channels",
         settings.CHANNELS_CACHE_TTL_SECONDS,
+        settings.CHANNELS_CACHE_STALE_SECONDS,
         lambda: _timed_call("channels scrape", scrape_channels, started_at=started_at),
     )
 
@@ -411,10 +427,12 @@ def refresh_schedule() -> list[LiveEvent]:
 
 
 def get_schedule() -> list[LiveEvent]:
-    return schedule_cache.remember(
+    started_at = perf_counter()
+    return schedule_cache.remember_stale(
         "schedule",
         settings.SCHEDULE_CACHE_TTL_SECONDS,
-        lambda: scrape_schedule(get_channel_index()),
+        settings.SCHEDULE_CACHE_STALE_SECONDS,
+        lambda: _timed_call("schedule scrape", lambda: scrape_schedule(get_channel_index()), started_at=started_at),
     )
 
 
@@ -428,9 +446,10 @@ def get_schedule_index() -> dict[str, LiveEvent]:
 
 def get_wrapper(channel_id: int) -> WrapperCatalog:
     started_at = perf_counter()
-    return watch_cache.remember(
+    return watch_cache.remember_stale(
         f"watch:{channel_id}",
         settings.WATCH_CACHE_TTL_SECONDS,
+        settings.WATCH_CACHE_STALE_SECONDS,
         lambda: _timed_call("watch fetch", lambda: fetch_wrapper(channel_id), started_at=started_at, channel_id=channel_id),
     )
 
@@ -494,7 +513,7 @@ def _channel_preview(channel: CatalogChannel, request: Request) -> dict:
         "name": channel.name,
         "poster": _poster_url(request, channel.meta_id),
         "posterShape": "poster",
-        "description": f"{channel.country_label} channel • ID {channel.channel_id}",
+        "description": f"{channel.country_label} channel â€¢ ID {channel.channel_id}",
         "genres": [channel.country_label],
     }
 
@@ -508,7 +527,7 @@ def _event_preview(event: LiveEvent, request: Request, config: dict[str, str]) -
         "name": event.title,
         "poster": _poster_url(request, event.meta_id),
         "posterShape": "poster",
-        "description": f"{day_label} • {time_text} • {event.category}",
+        "description": f"{day_label} â€¢ {time_text} â€¢ {event.category}",
         "genres": [event.category, *country_labels],
     }
 
@@ -573,6 +592,29 @@ def _proxy_media_url(
     safe_filename = quote(filename, safe="._-")
     query = urlencode({"url": upstream_url, "referer": referer})
     return f"{_service_base_url(request)}/proxy/{safe_filename}?{query}"
+
+
+def _follow_proxy_redirects(session, url: str, headers: dict[str, str]):
+    current_url = _validate_proxy_url(url, "url")
+    response = None
+    for _ in range(settings.PROXY_MAX_REDIRECTS + 1):
+        response = session.get(
+            current_url,
+            timeout=settings.HTTP_TIMEOUT_SECONDS,
+            stream=True,
+            allow_redirects=False,
+            headers=headers,
+        )
+
+        if 300 <= response.status_code < 400 and response.headers.get("Location"):
+            location = urljoin(current_url, response.headers["Location"])
+            response.close()
+            current_url = _validate_proxy_url(location, "redirect")
+            continue
+
+        return response
+
+    raise HTTPException(status_code=502, detail="too many upstream redirects")
 
 
 def _rewrite_playlist_line(request: Request, line: str, playlist_url: str, referer: str) -> str:
@@ -672,8 +714,8 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
                         request=request,
                         display_name=settings.ADDON_NAME,
                         description=(
-                            f"{channel.name} • {channel.country_label} • "
-                            f"{resolution.label} • {manifest.player_type.upper()}"
+                            f"{channel.name} â€¢ {channel.country_label} â€¢ "
+                            f"{resolution.label} â€¢ {manifest.player_type.upper()}"
                         ),
                         manifest_url=manifest.url,
                         referer=manifest.found_at_url,
@@ -755,7 +797,7 @@ def _resolve_live_channel_stream(event: LiveEvent, linked_channel, request: Requ
     return _manifest_to_stream(
         request=request,
         display_name=settings.ADDON_NAME,
-        description=f"{linked_channel.name} • {linked_channel.country_label} • {event.title} • {payload['player_type']}",
+        description=f"{linked_channel.name} â€¢ {linked_channel.country_label} â€¢ {event.title} â€¢ {payload['player_type']}",
         manifest_url=payload["url"],
         referer=payload["referer"],
         player_type=payload["player_type"],
@@ -785,8 +827,7 @@ def _build_live_streams(event: LiveEvent, request: Request, config: dict[str, st
                 break
 
             batch = attempt_channels[offset:offset + max_workers]
-            if max_workers == 1:
-                linked_channel = batch[0]
+            for linked_channel in batch:
                 stream = _resolve_live_channel_stream(event, linked_channel, request)
                 if not stream:
                     continue
@@ -798,29 +839,6 @@ def _build_live_streams(event: LiveEvent, request: Request, config: dict[str, st
                 if len(streams) >= _live_stream_result_limit(config):
                     _log_timing("live event stream resolve", started_at, event_id=event.meta_id, streams=len(streams))
                     return streams
-                continue
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    (
-                        linked_channel,
-                        executor.submit(_resolve_live_channel_stream, event, linked_channel, request),
-                    )
-                    for linked_channel in batch
-                ]
-
-                for linked_channel, future in futures:
-                    stream = future.result()
-                    if not stream:
-                        continue
-                    if stream["url"] in seen_urls:
-                        continue
-
-                    seen_urls.add(stream["url"])
-                    streams.append(stream)
-                    if len(streams) >= _live_stream_result_limit(config):
-                        _log_timing("live event stream resolve", started_at, event_id=event.meta_id, streams=len(streams))
-                        return streams
 
         _log_timing("live event stream resolve", started_at, event_id=event.meta_id, streams=len(streams))
         return streams
@@ -841,12 +859,6 @@ def _find_event(meta_id: str) -> LiveEvent | None:
 
     refresh_schedule()
     return get_schedule_index().get(meta_id)
-
-
-@app.on_event("shutdown")
-def _shutdown() -> None:
-    resolver.close()
-    close_pooled_sessions()
 
 
 @app.get("/")
@@ -886,7 +898,7 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None, config:
     extra_props = _parse_extra(extra)
     user_config = _parse_user_config(config)
     search = extra_props.get("search") or None
-    skip = int(extra_props.get("skip", "0") or 0)
+    skip = _parse_skip(extra_props.get("skip"))
 
     if catalog_def["kind"] == "channels":
         items = filter_channels(
@@ -920,7 +932,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
         channel = channel_index.get(channel_id)
         wrapper = watch_cache.get(f"watch:{channel_id}")
         if channel is None:
-            wrapper = wrapper or get_wrapper(channel_id)
+            wrapper = wrapper or _wrapper_or_http_error(channel_id)
             channel = CatalogChannel(
                 channel_id=channel_id,
                 name=wrapper.channel.name or wrapper.page.title or f"Channel {channel_id}",
@@ -941,7 +953,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
             "description": (
                 wrapper.page.description
                 if wrapper is not None and wrapper.page.description
-                else f"{channel.country_label} channel • ID {channel.channel_id}"
+                else f"{channel.country_label} channel â€¢ ID {channel.channel_id}"
             ),
             "genres": [channel.country_label],
             "videos": [_default_video(channel.meta_id, channel.name)],
@@ -962,7 +974,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
         "posterShape": "poster",
         "background": _poster_url(request, event.meta_id),
         "description": (
-            f"{event_day_label} • {event_time_text} • {event.category}\n"
+            f"{event_day_label} â€¢ {event_time_text} â€¢ {event.category}\n"
             f"Channels: {', '.join(channel.name for channel in event.channels)}"
         ),
         "genres": [event.category, *[_country_label(code) for code in event.country_codes]],
@@ -980,7 +992,7 @@ def stream(request: Request, meta_id: str, config: str | None = None) -> JSONRes
     if kind == "channel":
         channel = get_cached_channel(value)
         if channel is None:
-            wrapper = get_wrapper(value)
+            wrapper = _wrapper_or_http_error(value)
             channel = CatalogChannel(
                 channel_id=value,
                 name=wrapper.channel.name or wrapper.page.title or f"Channel {value}",
@@ -1007,28 +1019,24 @@ def proxy_media(
     referer: str = Query(...),
 ) -> Response:
     started_at = perf_counter()
+    validated_url = _validate_proxy_url(url, "url")
+    validated_referer = _validate_proxy_url(referer, "referer")
     playlist_cache_key = None
     if filename.lower().endswith(".m3u8"):
-        playlist_cache_key = _playlist_cache_key(url, referer)
+        playlist_cache_key = _playlist_cache_key(_service_base_url(request), validated_url, validated_referer)
         cached_playlist = playlist_cache.get(playlist_cache_key)
         if cached_playlist is not None:
             _log_timing("proxy playlist cache hit", started_at, filename=filename)
             return Response(content=cached_playlist, media_type="application/vnd.apple.mpegurl")
 
     session = get_pooled_session()
-    headers = {"Referer": referer}
+    headers = {"Referer": validated_referer}
 
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
 
-    upstream = session.get(
-        url,
-        timeout=settings.HTTP_TIMEOUT_SECONDS,
-        stream=True,
-        allow_redirects=True,
-        headers=headers,
-    )
+    upstream = _follow_proxy_redirects(session, validated_url, headers)
     upstream.raise_for_status()
     content_type = upstream.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
 
@@ -1040,7 +1048,7 @@ def proxy_media(
             _log_timing("proxy non-hls playlist passthrough", started_at, filename=filename)
             return Response(content=body, media_type=content_type or "text/plain")
 
-        rewritten = _rewrite_hls_playlist(request, body, upstream.url, referer)
+        rewritten = _rewrite_hls_playlist(request, body, upstream.url, validated_referer)
         playlist_cache.set(
             playlist_cache_key,
             rewritten,
@@ -1095,7 +1103,7 @@ def poster(meta_id: str) -> Response:
     if kind == "channel":
         channel = get_channel_index().get(value)
         if channel is None:
-            wrapper = get_wrapper(value)
+            wrapper = _wrapper_or_http_error(value)
             title = wrapper.channel.name or wrapper.page.title or f"Channel {value}"
             subtitle = settings.COUNTRY_LABELS["global"]
             accent = "global"
@@ -1112,6 +1120,7 @@ def poster(meta_id: str) -> Response:
         return Response(content=svg, media_type="image/svg+xml")
 
     accent = event.country_codes[0] if event.country_codes else "global"
-    subtitle = f"{event.time_text} • {event.category}"
+    subtitle = f"{event.time_text} â€¢ {event.category}"
     svg = render_svg_poster(event.title, subtitle, accent)
     return Response(content=svg, media_type="image/svg+xml")
+

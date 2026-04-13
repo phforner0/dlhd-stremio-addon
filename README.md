@@ -224,8 +224,16 @@ https://your-domain.example.com/manifest.json
 
 The service exposes a few environment variables for tuning live stream resolution:
 
+- `DLHD_PROXY_ALLOWED_HOSTS`
+  Host allowlist for `/proxy` upstream and redirect targets.
+- `DLHD_PROXY_MAX_REDIRECTS`
+  Caps upstream redirect hops for `/proxy`. Default: `5`
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`
   Limits concurrent Playwright resolutions across requests. Default: `4`
+- `DLHD_PLAYWRIGHT_IGNORE_HTTPS_ERRORS`
+  Enables Playwright TLS bypass globally. Default: `0`
+- `DLHD_PLAYWRIGHT_IGNORE_HTTPS_ERROR_HOSTS`
+  Optional host allowlist for TLS bypass when the global flag is off.
 - `DLHD_PLAYWRIGHT_REUSE_BROWSER`
   Reuses one Playwright browser per worker thread to reduce cold-start cost. Default: `1`
 - `DLHD_PLAYWRIGHT_BROWSER_MAX_USES`
@@ -248,6 +256,12 @@ The service exposes a few environment variables for tuning live stream resolutio
   Converts scraped schedule times from UK GMT to a fixed display offset. Default: `0`
 - `DLHD_EVENT_STALE_AFTER_MINUTES`
   Hides schedule entries older than this many minutes so clearly finished events drop out. Default: `360`
+- `DLHD_CHANNELS_CACHE_STALE_TTL`
+  Returns stale channel data while refreshing in the background. Default: `900`
+- `DLHD_SCHEDULE_CACHE_STALE_TTL`
+  Returns stale schedule data while refreshing in the background. Default: `120`
+- `DLHD_WATCH_CACHE_STALE_TTL`
+  Returns stale `watch.php` metadata while refreshing in the background. Default: `900`
 - `DLHD_STREAM_CACHE_TTL`
   Caches fully built `stream` endpoint responses. Default: `120`
 - `DLHD_LIVE_CHANNEL_CACHE_TTL`
@@ -258,6 +272,12 @@ The service exposes a few environment variables for tuning live stream resolutio
   HTTP connection pool size baseline for upstream proxy requests. Default: `32`
 - `DLHD_HTTP_POOL_MAXSIZE`
   Maximum pooled upstream connections per protocol. Default: `64`
+- `DLHD_SAFE_HTTP_RETRY_TOTAL`
+  Retries idempotent scrape/bootstrap requests. Default: `2`
+- `DLHD_SAFE_HTTP_RETRY_BACKOFF_SECONDS`
+  Backoff factor for those safe retries. Default: `0.25`
+- `*_CACHE_MAX_ENTRIES`
+  Bounded cache entry caps for channels, schedule, watch, stream, live-channel, and playlist caches.
 
 The addon now uses two complementary live caches:
 
@@ -270,9 +290,15 @@ You can override these in `.env` or your deployment platform:
 
 - `PORT`: service listen port inside the container. Default: `7000`
 - `DLHD_BASE_URL`: upstream site base URL. Default: `https://dlstreams.top`
+- `DLHD_PROXY_ALLOWED_HOSTS`: allowlist for `/proxy` targets and redirects.
+- `DLHD_PROXY_MAX_REDIRECTS`: max upstream redirects followed by `/proxy`. Default: `5`
 - `DLHD_HTTP_POOL_CONNECTIONS`: pooled upstream HTTP connection count. Default: `32`
 - `DLHD_HTTP_POOL_MAXSIZE`: pooled upstream HTTP max size. Default: `64`
+- `DLHD_SAFE_HTTP_RETRY_TOTAL`: retry count for idempotent scrape/bootstrap requests. Default: `2`
+- `DLHD_SAFE_HTTP_RETRY_BACKOFF_SECONDS`: retry backoff factor for safe requests. Default: `0.25`
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`: max simultaneous Playwright resolutions. Default: `4`
+- `DLHD_PLAYWRIGHT_IGNORE_HTTPS_ERRORS`: enable Playwright TLS bypass globally. Default: `0`
+- `DLHD_PLAYWRIGHT_IGNORE_HTTPS_ERROR_HOSTS`: host allowlist for Playwright TLS bypass.
 - `DLHD_PLAYWRIGHT_REUSE_BROWSER`: reuse one Playwright browser per worker thread. Default: `1`
 - `DLHD_PLAYWRIGHT_BROWSER_MAX_USES`: recycle a reused browser after this many resolutions. Default: `12`
 - `DLHD_PLAYWRIGHT_BROWSER_MAX_IDLE_SECONDS`: recycle a reused browser after this idle time in seconds. Default: `45`
@@ -284,6 +310,9 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_LIVE_STREAM_BUDGET_SECONDS`: max wall-clock budget for one live event resolution. Default: `30`
 - `DLHD_SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES`: fixed display offset applied to schedule times parsed from UK GMT. Default: `0`
 - `DLHD_EVENT_STALE_AFTER_MINUTES`: hide schedule entries older than this many minutes. Default: `360`
+- `DLHD_CHANNELS_CACHE_STALE_TTL`: stale-while-revalidate window for channel catalog data. Default: `900`
+- `DLHD_SCHEDULE_CACHE_STALE_TTL`: stale-while-revalidate window for schedule data. Default: `120`
+- `DLHD_WATCH_CACHE_STALE_TTL`: stale-while-revalidate window for watch-page metadata. Default: `900`
 - `DLHD_CHANNELS_CACHE_TTL`: channel catalog cache TTL. Default: `43200`
 - `DLHD_SCHEDULE_CACHE_TTL`: live schedule cache TTL. Default: `120`
 - `DLHD_WATCH_CACHE_TTL`: `watch.php` metadata cache TTL. Default: `1800`

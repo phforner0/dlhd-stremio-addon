@@ -7,6 +7,7 @@ from app import settings
 from app.main import (
     _build_channel_streams,
     _encode_user_config,
+    _effective_country_filter,
     _event_display_values,
     _looks_like_hls_playlist,
     _ordered_live_channels,
@@ -56,6 +57,14 @@ def test_parse_user_config_accepts_base64url_token() -> None:
     config = _parse_user_config(token)
 
     assert config == {"scheduleOffsetMin": "-180", "catalogMode": "focused"}
+
+
+def test_effective_country_filter_keeps_all_catalogs_unfiltered() -> None:
+    catalog_def = {"country_code": None}
+
+    country_code = _effective_country_filter(catalog_def, {"catalogMode": "focused", "preferredCountryCode": "br"})
+
+    assert country_code is None
 
 
 def test_ordered_live_channels_prefers_event_country_before_cached_global() -> None:

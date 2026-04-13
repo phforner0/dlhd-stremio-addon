@@ -6,6 +6,7 @@ from time import perf_counter
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
+import requests
 
 from app import settings
 from app.http import build_session
@@ -22,6 +23,13 @@ from app.models import (
 )
 
 LOGGER = logging.getLogger("dlhd.scrape.watch")
+
+
+class WatchFetchError(Exception):
+    def __init__(self, channel_id: int, status_code: int | None, message: str) -> None:
+        super().__init__(message)
+        self.channel_id = channel_id
+        self.status_code = status_code
 
 SELECTORS = {
     "description_meta": 'meta[name="description"]',
@@ -143,14 +151,20 @@ def parse_wrapper(html: str, base_url: str | None = None) -> WrapperCatalog:
 def fetch_wrapper(channel_id: int) -> WrapperCatalog:
     started_at = perf_counter()
     url = f"{settings.BASE_SITE_URL}/watch.php?id={channel_id}"
-    with build_session() as session:
-        response = session.get(url, timeout=settings.HTTP_TIMEOUT_SECONDS, allow_redirects=True)
-        response.raise_for_status()
-        response.encoding = response.encoding or "utf-8"
-        wrapper = parse_wrapper(response.text, response.url)
-        LOGGER.debug(
-            "fetch wrapper duration_ms=%s channel_id=%s",
-            round((perf_counter() - started_at) * 1000),
-            channel_id,
-        )
-        return wrapper
+    try:
+        with build_session() as session:
+            response = session.get(url, timeout=settings.HTTP_TIMEOUT_SECONDS, allow_redirects=True)
+            response.raise_for_status()
+            response.encoding = response.encoding or "utf-8"
+            wrapper = parse_wrapper(response.text, response.url)
+            LOGGER.debug(
+                "fetch wrapper duration_ms=%s channel_id=%s",
+                round((perf_counter() - started_at) * 1000),
+                channel_id,
+            )
+            return wrapper
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        raise WatchFetchError(channel_id, status_code, f"watch fetch failed for channel {channel_id}") from exc
+    except requests.RequestException as exc:
+        raise WatchFetchError(channel_id, None, f"watch fetch failed for channel {channel_id}") from exc

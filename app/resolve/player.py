@@ -26,6 +26,24 @@ def _log_timing(message: str, started_at: float, **fields: object) -> None:
     else:
         LOGGER.debug("%s duration_ms=%s", message, elapsed_ms)
 
+
+def _host_matches(host: str, allowed: str) -> bool:
+    lowered = host.lower()
+    if allowed.startswith("."):
+        return lowered == allowed[1:] or lowered.endswith(allowed)
+    return lowered == allowed
+
+
+def _should_ignore_https_errors(player_url: str) -> bool:
+    if settings.PLAYWRIGHT_IGNORE_HTTPS_ERRORS:
+        return True
+
+    parsed = urlparse(player_url)
+    host = parsed.hostname
+    if not host:
+        return False
+    return any(_host_matches(host, allowed) for allowed in settings.PLAYWRIGHT_IGNORE_HTTPS_ERROR_HOSTS)
+
 MANIFEST_RE: tuple[re.Pattern[str], ...] = (
     re.compile(r'(https?://[^\s\'"<>{}\[\]\\]+\.m3u8(?:[?#][^\s\'"<>]*)?)', re.I),
     re.compile(r'(https?://[^\s\'"<>{}\[\]\\]+\.mpd(?:[?#][^\s\'"<>]*)?)', re.I),
@@ -665,7 +683,7 @@ class PlaywrightResolver:
                         context = browser.new_context(
                             user_agent=DEFAULT_HEADERS["User-Agent"],
                             locale="pt-BR",
-                            ignore_https_errors=True,
+                            ignore_https_errors=_should_ignore_https_errors(player_url),
                         )
                         break
                     except Exception:
