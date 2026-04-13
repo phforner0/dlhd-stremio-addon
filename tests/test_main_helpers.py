@@ -93,6 +93,8 @@ def test_ordered_live_channels_prefers_event_country_before_cached_global() -> N
 
 
 def test_resolve_live_channel_stream_keeps_addon_name_and_descriptive_label() -> None:
+    from app import main as main_module
+
     linked_channel = ScheduleChannelLink(88, "Premier Brasil", "br", "Brazil")
     event = LiveEvent(
         meta_id="dlhd:live:test",
@@ -121,6 +123,9 @@ def test_resolve_live_channel_stream_keeps_addon_name_and_descriptive_label() ->
         }
     )
 
+    original_validator = main_module._valid_hls_stream
+    main_module._valid_hls_stream = lambda manifest_url, referer: True
+
     stream = _resolve_live_channel_stream(event, linked_channel, request)
 
     assert stream is not None
@@ -129,6 +134,7 @@ def test_resolve_live_channel_stream_keeps_addon_name_and_descriptive_label() ->
     assert "Brazil" in stream["description"]
     assert "Athletico-PR vs Chapecoense" in stream["description"]
     live_channel_stream_cache.delete("live-channel:88")
+    main_module._valid_hls_stream = original_validator
 
 
 def test_event_display_values_use_user_offset() -> None:
@@ -195,6 +201,7 @@ def test_build_channel_streams_keeps_addon_name_and_descriptive_label(monkeypatc
 
     monkeypatch.setattr("app.main.get_wrapper", lambda channel_id: wrapper)
     monkeypatch.setattr("app.main.resolver.resolve_player", lambda label, player_url: resolution)
+    monkeypatch.setattr("app.main._valid_hls_stream", lambda manifest_url, referer: True)
 
     cache_key = f"stream:channel:{channel.channel_id}:http://127.0.0.1:7000"
     stream_cache.delete(cache_key)
@@ -206,4 +213,62 @@ def test_build_channel_streams_keeps_addon_name_and_descriptive_label(monkeypatc
     assert "ESPN Brasil" in streams[0]["description"]
     assert "Brazil" in streams[0]["description"]
     assert "Player 1" in streams[0]["description"]
+    stream_cache.delete(cache_key)
+
+
+def test_build_channel_streams_skips_invalid_hls_manifest(monkeypatch) -> None:
+    channel = CatalogChannel(
+        channel_id=81,
+        name="ESPN Brasil",
+        watch_url="https://example.test/watch.php?id=81",
+        search_hint=None,
+        group_letter=None,
+        country_code="br",
+        country_label="Brazil",
+    )
+    wrapper = WrapperCatalog(
+        source=SourceInfo(input=channel.watch_url, type="url"),
+        channel=ChannelInfo(id=81, name="ESPN Brasil", heading="ESPN Brasil"),
+        page=PageInfo(title="ESPN Brasil", description="Sports", canonicalUrl=channel.watch_url, poster=None),
+        player=PlayerInfo(
+            primary=PrimaryPlayer(label="primary", url="https://example.test/player"),
+            alternates=[],
+        ),
+        related=RelatedInfo(label=None),
+    )
+    resolution = PlayerResolution(
+        label="Player 1",
+        player_page_url="https://example.test/player",
+        manifests=[
+            ManifestResult(
+                url="https://example.test/channel.m3u8",
+                player_type="hls",
+                found_at_url="https://example.test/ref",
+                source="network",
+            )
+        ],
+    )
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "server": ("127.0.0.1", 7000),
+            "client": ("127.0.0.1", 12345),
+            "path": "/",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    monkeypatch.setattr("app.main.get_wrapper", lambda channel_id: wrapper)
+    monkeypatch.setattr("app.main.resolver.resolve_player", lambda label, player_url: resolution)
+    monkeypatch.setattr("app.main._valid_hls_stream", lambda manifest_url, referer: False)
+
+    cache_key = f"stream:channel:{channel.channel_id}:http://127.0.0.1:7000:{'channelStreamResults=1'}"
+    stream_cache.delete(cache_key)
+
+    streams = _build_channel_streams(channel, request, {"channelStreamResults": "1"})
+
+    assert streams == []
     stream_cache.delete(cache_key)

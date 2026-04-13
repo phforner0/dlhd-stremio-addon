@@ -58,6 +58,7 @@ watch_cache: TTLCache[WrapperCatalog] = TTLCache(max_entries=settings.WATCH_CACH
 stream_cache: TTLCache[list[dict]] = TTLCache(max_entries=settings.STREAM_CACHE_MAX_ENTRIES)
 live_channel_stream_cache: TTLCache[dict[str, str]] = TTLCache(max_entries=settings.LIVE_CHANNEL_CACHE_MAX_ENTRIES)
 playlist_cache: TTLCache[str] = TTLCache(max_entries=settings.HLS_PLAYLIST_CACHE_MAX_ENTRIES)
+manifest_validation_cache: TTLCache[bool] = TTLCache(max_entries=settings.HLS_VALIDATION_MAX_ENTRIES)
 resolver = PlaywrightResolver()
 
 
@@ -147,6 +148,74 @@ def _wrapper_or_http_error(channel_id: int) -> WrapperCatalog:
 
 def _looks_like_hls_playlist(body: str) -> bool:
     return body.lstrip().startswith("#EXTM3U")
+
+
+def _extract_hls_probe_targets(body: str, base_url: str) -> tuple[str | None, str | None]:
+    key_url = None
+    media_url = None
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#EXT-X-KEY") and key_url is None:
+            match = HLS_URI_ATTR_RE.search(stripped)
+            if match:
+                key_url = urljoin(base_url, match.group(1))
+            continue
+        if stripped.startswith("#"):
+            continue
+        media_url = urljoin(base_url, stripped)
+        break
+    return key_url, media_url
+
+
+def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> bool:
+    if depth > 2:
+        return False
+
+    session = build_session()
+    try:
+        headers = {"Referer": referer}
+        response = _follow_proxy_redirects(session, url, headers)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+
+        if content_type in {"application/json", "text/html"}:
+            response.close()
+            return False
+
+        if urlparse(response.url).path.lower().endswith(".m3u8") or "mpegurl" in content_type:
+            body = response.text
+            response.close()
+            if not _looks_like_hls_playlist(body):
+                return False
+
+            key_url, media_url = _extract_hls_probe_targets(body, response.url)
+            if key_url is not None:
+                key_response = _follow_proxy_redirects(session, key_url, headers)
+                key_response.raise_for_status()
+                key_response.close()
+            if media_url is None:
+                return False
+            return _probe_hls_target(media_url, referer, depth=depth + 1)
+
+        response.close()
+        return True
+    except Exception:
+        return False
+    finally:
+        session.close()
+
+
+def _valid_hls_stream(manifest_url: str, referer: str) -> bool:
+    cache_key = f"hls-valid:{manifest_url}|{referer}"
+    cached = manifest_validation_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    valid = _probe_hls_target(manifest_url, referer)
+    manifest_validation_cache.set(cache_key, valid, settings.HLS_VALIDATION_TTL_SECONDS)
+    return valid
 
 
 def _poster_url(request: Request, meta_id: str) -> str:
@@ -708,6 +777,9 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
             for manifest in resolution.manifests:
                 if manifest.url in seen_urls:
                     continue
+                if manifest.player_type.lower() == "hls" and not _valid_hls_stream(manifest.url, manifest.found_at_url):
+                    LOGGER.warning("Skipping invalid HLS manifest for channel %s: %s", channel.channel_id, manifest.url)
+                    continue
                 seen_urls.add(manifest.url)
                 streams.append(
                     _manifest_to_stream(
@@ -792,6 +864,9 @@ def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
 def _resolve_live_channel_stream(event: LiveEvent, linked_channel, request: Request) -> dict | None:
     payload = _get_live_channel_payload(linked_channel)
     if not payload:
+        return None
+    if payload["player_type"].lower() == "hls" and not _valid_hls_stream(payload["url"], payload["referer"]):
+        LOGGER.warning("Skipping invalid live HLS manifest for channel %s: %s", linked_channel.channel_id, payload["url"])
         return None
 
     return _manifest_to_stream(
