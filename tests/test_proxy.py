@@ -85,6 +85,33 @@ def test_proxy_rechecks_redirect_target(monkeypatch) -> None:
     assert response.status_code == 403
 
 
+def test_proxy_allows_redirect_media_chain_to_public_media_host(monkeypatch) -> None:
+    client = TestClient(app)
+    session = FakeSession(
+        {
+            "https://embedkclx.sbs/redirect/media/test/path.js": FakeResponse(
+                "https://embedkclx.sbs/redirect/media/test/path.js",
+                status_code=302,
+                headers={"Location": "https://f003.dsfkjngkjndf.sbs/media/test/path.js"},
+            ),
+            "https://f003.dsfkjngkjndf.sbs/media/test/path.js": FakeResponse(
+                "https://f003.dsfkjngkjndf.sbs/media/test/path.js",
+                headers={"Content-Type": "application/javascript"},
+                content=b"\xa5\x00\x01",
+            ),
+        }
+    )
+    monkeypatch.setattr("app.main.get_pooled_session", lambda: session)
+    monkeypatch.setattr("app.main._public_host", lambda host: True)
+
+    response = client.get(
+        "/proxy/path.js",
+        params={"url": "https://embedkclx.sbs/redirect/media/test/path.js", "referer": "https://embedkclx.sbs/premiumtv/daddyhd.php?id=81"},
+    )
+
+    assert response.status_code == 200
+
+
 def test_proxy_playlist_cache_isolated_by_host(monkeypatch) -> None:
     client = TestClient(app)
     playlist_cache.prune()
