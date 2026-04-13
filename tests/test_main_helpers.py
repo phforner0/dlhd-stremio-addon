@@ -9,6 +9,7 @@ from app.main import (
     _encode_user_config,
     _effective_country_filter,
     _event_display_values,
+    _is_hls_playlist_candidate,
     _looks_like_hls_playlist,
     _ordered_live_channels,
     _parse_user_config,
@@ -43,6 +44,10 @@ def test_hls_playlist_detection_rejects_non_playlist_text() -> None:
     body = "console.log('not a playlist');"
 
     assert _looks_like_hls_playlist(body) is False
+
+
+def test_hls_playlist_candidate_accepts_css_text_playlist_sources() -> None:
+    assert _is_hls_playlist_candidate("https://example.test/mono.css", "text/txt") is True
 
 
 def test_parse_user_config_accepts_json_path_segment() -> None:

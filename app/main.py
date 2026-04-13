@@ -169,6 +169,17 @@ def _extract_hls_probe_targets(body: str, base_url: str) -> tuple[str | None, st
     return key_url, media_url
 
 
+def _is_hls_playlist_candidate(url: str, content_type: str) -> bool:
+    lowered_path = urlparse(url).path.lower()
+    lowered_type = content_type.lower()
+    return (
+        lowered_path.endswith(".m3u8")
+        or lowered_path.endswith(".css")
+        or "mpegurl" in lowered_type
+        or lowered_type in {"text/plain", "text/txt", "application/vnd.apple.mpegurl"}
+    )
+
+
 def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> bool:
     if depth > 2:
         return False
@@ -184,7 +195,7 @@ def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> bool:
             response.close()
             return False
 
-        if urlparse(response.url).path.lower().endswith(".m3u8") or "mpegurl" in content_type:
+        if _is_hls_playlist_candidate(response.url, content_type):
             body = response.text
             response.close()
             if not _looks_like_hls_playlist(body):
