@@ -127,6 +127,22 @@ def _validate_proxy_url(raw_url: str, field_name: str) -> str:
     return raw_url
 
 
+def _allow_proxy_redirect(current_url: str, target_url: str) -> bool:
+    current = urlparse(current_url)
+    target = urlparse(target_url)
+    if not target.hostname or target.scheme not in {"http", "https"}:
+        return False
+    if not _public_host(target.hostname):
+        return False
+    if _host_allowed(target.hostname):
+        return True
+
+    if current.hostname and _host_allowed(current.hostname) and current.path.startswith("/redirect/media/"):
+        return target.path.startswith("/media/")
+
+    return False
+
+
 def _parse_skip(raw_skip: str | None) -> int:
     if raw_skip is None or raw_skip == "":
         return 0
@@ -689,7 +705,9 @@ def _follow_proxy_redirects(session, url: str, headers: dict[str, str]):
         if 300 <= response.status_code < 400 and response.headers.get("Location"):
             location = urljoin(current_url, response.headers["Location"])
             response.close()
-            current_url = _validate_proxy_url(location, "redirect")
+            if not _allow_proxy_redirect(current_url, location):
+                raise HTTPException(status_code=403, detail="disallowed redirect host")
+            current_url = location
             continue
 
         return response
