@@ -186,6 +186,12 @@ def _event_display_values(event: LiveEvent, config: dict[str, str]) -> tuple[str
 
 
 def _configure_page(request: Request) -> str:
+    return _configure_page_v2(request)
+
+
+def _configure_page_legacy(request: Request) -> str:
+    return _configure_page_v2(request)
+
     default_offset = settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES
     options = []
     for minutes in range(-12 * 60, 14 * 60 + 1, 30):
@@ -360,13 +366,9 @@ def _find_catalog(catalog_id: str) -> dict:
 
 
 def _effective_country_filter(catalog_def: dict, config: dict[str, str]) -> str | None:
-    configured_country = _preferred_country_code(config)
     catalog_country = catalog_def["country_code"]
     if catalog_country is not None:
         return catalog_country
-
-    if _catalog_mode(config) == "focused" and configured_country is not None:
-        return configured_country
 
     return None
 
@@ -854,7 +856,7 @@ def root() -> RedirectResponse:
 
 @app.get("/configure")
 def configure(request: Request) -> HTMLResponse:
-    return HTMLResponse(_configure_page_v2(request))
+    return HTMLResponse(_configure_page(request))
 
 
 @app.get("/healthz")
