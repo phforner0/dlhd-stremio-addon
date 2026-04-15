@@ -23,8 +23,8 @@ LOGGER = logging.getLogger("dlhd.artwork")
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/svg+xml"}
 CHANNEL_ARTWORK_CACHE: TTLCache["ArtworkResolution"] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="channel_artwork")
 EVENT_ARTWORK_CACHE: TTLCache["ArtworkResolution"] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="event_artwork")
-EVENT_BADGE_SVG_CACHE: TTLCache[str | None] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="event_badge_svg")
-TEAM_ARTWORK_CACHE: TTLCache[tuple[str | None, str | None]] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="team_artwork")
+EVENT_BADGE_SVG_CACHE: TTLCache["_OptionalValue"] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="event_badge_svg")
+TEAM_ARTWORK_CACHE: TTLCache["_OptionalValue"] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="team_artwork")
 IMAGE_BINARY_CACHE: TTLCache[tuple[bytes, str]] = TTLCache(max_entries=settings.ARTWORK_IMAGE_CACHE_MAX_ENTRIES, name="artwork_image")
 PLACEHOLDER_POSTER_PATHS = {"/assets/logos/logo.png"}
 PLACEHOLDER_POSTER_RE = re.compile(r"/(?:logo|default|placeholder)(?:\.[a-z0-9]+)?$", re.I)
@@ -55,6 +55,11 @@ class ArtworkResolution:
     source: str
 
 
+@dataclass(slots=True)
+class _OptionalValue:
+    value: object
+
+
 _T = TypeVar("_T")
 
 
@@ -68,13 +73,13 @@ def _remember_cached_artwork(cache: TTLCache[ArtworkResolution], key: str, facto
     return resolution
 
 
-def _remember_cached_optional(cache: TTLCache[_T | None], key: str, factory: Callable[[], _T | None]) -> _T | None:
+def _remember_cached_optional(cache: TTLCache[_OptionalValue], key: str, factory: Callable[[], _T | None]) -> _T | None:
     cached = cache.get(key)
     if cached is not None:
-        return cached
+        return cached.value  # type: ignore[return-value]
     value = factory()
     ttl = settings.ARTWORK_CACHE_TTL_SECONDS if value else settings.ARTWORK_MISS_CACHE_TTL_SECONDS
-    cache.set(key, value, ttl)
+    cache.set(key, _OptionalValue(value), ttl)
     return value
 
 

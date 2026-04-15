@@ -242,6 +242,8 @@ The service exposes a few environment variables for tuning live stream resolutio
   Makes `DLHD_ARTWORK_ALLOWED_HOSTS` replace the built-in artwork allowlist. Default: `0`
 - `DLHD_ARTWORK_CACHE_TTL`
   Metadata cache TTL for resolved artwork sources. Default: `21600`
+- `DLHD_ARTWORK_MISS_CACHE_TTL`
+  Shorter cache TTL for fallback/miss artwork results so newly available artwork can appear sooner. Default: `1800`
 - `DLHD_ARTWORK_IMAGE_CACHE_TTL`
   Binary cache TTL for fetched remote images. Default: `21600`
 - `DLHD_PROXY_MAX_REDIRECTS`
@@ -317,6 +319,7 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_ARTWORK_ALLOWED_HOSTS`: optional additive allowlist for remote artwork fetches.
 - `DLHD_ARTWORK_ALLOWED_HOSTS_STRICT`: replace the built-in artwork allowlist instead of extending it. Default: `0`
 - `DLHD_ARTWORK_CACHE_TTL`: artwork metadata cache TTL. Default: `21600`
+- `DLHD_ARTWORK_MISS_CACHE_TTL`: fallback/miss artwork cache TTL. Default: `1800`
 - `DLHD_ARTWORK_CACHE_MAX_ENTRIES`: artwork metadata cache size. Default: `512`
 - `DLHD_ARTWORK_IMAGE_CACHE_TTL`: remote image binary cache TTL. Default: `21600`
 - `DLHD_ARTWORK_IMAGE_CACHE_MAX_ENTRIES`: remote image binary cache size. Default: `256`
