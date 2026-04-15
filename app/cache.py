@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Generic, TypeVar
 
+from app.logging_utils import log_event
+
 T = TypeVar("T")
+LOGGER = logging.getLogger("dlhd.cache")
 
 
 @dataclass(slots=True)
@@ -17,12 +21,32 @@ class _Entry(Generic[T]):
 
 
 class TTLCache(Generic[T]):
-    def __init__(self, *, max_entries: int | None = None) -> None:
+    def __init__(self, *, max_entries: int | None = None, name: str = "cache") -> None:
         self._entries: OrderedDict[str, _Entry[T]] = OrderedDict()
         self._locks: dict[str, threading.Lock] = {}
         self._refreshing: set[str] = set()
         self._guard = threading.Lock()
         self._max_entries = max_entries
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def entry_count(self) -> int:
+        with self._guard:
+            return len(self._entries)
+
+    def _key_class(self, key: str) -> str:
+        return key.split(":", 1)[0] if ":" in key else "default"
+
+    def _base_fields(self, key: str, **extra: object) -> dict[str, object]:
+        return {
+            "cache_name": self._name,
+            "cache_key_class": self._key_class(key),
+            "max_entries": self._max_entries,
+            **extra,
+        }
 
     def _touch_unlocked(self, key: str) -> None:
         self._entries.move_to_end(key)
@@ -39,6 +63,12 @@ class TTLCache(Generic[T]):
             self._entries.pop(evict_key, None)
             self._locks.pop(evict_key, None)
             self._refreshing.discard(evict_key)
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "cache_evicted",
+                **self._base_fields(evict_key, entry_count=len(self._entries)),
+            )
 
     def _prune_expired_unlocked(
         self,
@@ -68,10 +98,14 @@ class TTLCache(Generic[T]):
             self._prune_expired_unlocked(now)
             entry = self._entries.get(key)
             if not entry:
+                log_event(LOGGER, logging.DEBUG, "cache_miss", **self._base_fields(key, cache_status="missing"))
                 return None
             if not allow_stale and entry.expires_at <= now:
+                log_event(LOGGER, logging.DEBUG, "cache_miss", **self._base_fields(key, cache_status="expired"))
                 return None
             self._touch_unlocked(key)
+            event = "cache_stale_hit" if entry.expires_at <= now else "cache_hit"
+            log_event(LOGGER, logging.DEBUG, event, **self._base_fields(key, cache_status="stale" if event == "cache_stale_hit" else "fresh"))
             return entry.value
 
     def set(self, key: str, value: T, ttl_seconds: int, *, stale_ttl_seconds: int = 0) -> T:
@@ -83,6 +117,18 @@ class TTLCache(Generic[T]):
             self._entries[key] = _Entry(value=value, expires_at=expires_at, stale_until=stale_until)
             self._touch_unlocked(key)
             self._evict_overflow_unlocked({key})
+            entry_count = len(self._entries)
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "cache_set",
+            **self._base_fields(
+                key,
+                ttl_seconds=ttl_seconds,
+                stale_ttl_seconds=stale_ttl_seconds,
+                entry_count=entry_count,
+            ),
+        )
         return value
 
     def delete(self, key: str) -> None:
@@ -93,7 +139,20 @@ class TTLCache(Generic[T]):
 
     def prune(self) -> None:
         with self._guard:
+            before = len(self._entries)
             self._prune_expired_unlocked()
+            removed = before - len(self._entries)
+            entry_count = len(self._entries)
+        if removed:
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "cache_pruned",
+                cache_name=self._name,
+                entry_count=entry_count,
+                removed_count=removed,
+                max_entries=self._max_entries,
+            )
 
     def _compute_and_store(self, key: str, ttl_seconds: int, stale_ttl_seconds: int, factory: Callable[[], T]) -> T:
         with self._guard:
@@ -115,8 +174,33 @@ class TTLCache(Generic[T]):
         stale_ttl_seconds: int,
         factory: Callable[[], T],
     ) -> None:
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "cache_refresh_start",
+            **self._base_fields(key, ttl_seconds=ttl_seconds, stale_ttl_seconds=stale_ttl_seconds),
+        )
         try:
             self._compute_and_store(key, ttl_seconds, stale_ttl_seconds, factory)
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "cache_refresh_end",
+                **self._base_fields(key, ttl_seconds=ttl_seconds, stale_ttl_seconds=stale_ttl_seconds),
+            )
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "cache_refresh_fail",
+                **self._base_fields(
+                    key,
+                    ttl_seconds=ttl_seconds,
+                    stale_ttl_seconds=stale_ttl_seconds,
+                    reason=exc.__class__.__name__,
+                ),
+            )
+            raise
         finally:
             with self._guard:
                 self._refreshing.discard(key)
@@ -147,6 +231,12 @@ class TTLCache(Generic[T]):
 
                 if key not in self._refreshing:
                     self._refreshing.add(key)
+                    log_event(
+                        LOGGER,
+                        logging.DEBUG,
+                        "cache_stale_served",
+                        **self._base_fields(key, ttl_seconds=ttl_seconds, stale_ttl_seconds=stale_ttl_seconds),
+                    )
                     threading.Thread(
                         target=self._refresh_in_background,
                         args=(key, ttl_seconds, stale_ttl_seconds, factory),

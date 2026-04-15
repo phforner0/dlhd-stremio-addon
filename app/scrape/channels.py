@@ -5,9 +5,11 @@ from time import perf_counter
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
+import requests
 
 from app import settings
 from app.http import build_session
+from app.logging_utils import log_event, proxy_url_fields
 from app.models import CatalogChannel
 from app.normalize.country import classify_channel_country
 
@@ -16,13 +18,27 @@ LOGGER = logging.getLogger("dlhd.scrape.channels")
 
 def scrape_channels() -> list[CatalogChannel]:
     started_at = perf_counter()
-    with build_session() as session:
-        response = session.get(
-            f"{settings.BASE_SITE_URL}/24-7-channels.php",
-            timeout=settings.HTTP_TIMEOUT_SECONDS,
+    url = f"{settings.BASE_SITE_URL}/24-7-channels.php"
+    log_event(LOGGER, logging.INFO, "scrape_channels_start", **proxy_url_fields(url))
+    try:
+        with build_session() as session:
+            response = session.get(
+                url,
+                timeout=settings.HTTP_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            response.encoding = response.encoding or "utf-8"
+    except requests.RequestException as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "scrape_channels_fail",
+            status_code=status_code,
+            duration_ms=round((perf_counter() - started_at) * 1000),
+            **proxy_url_fields(url),
         )
-        response.raise_for_status()
-        response.encoding = response.encoding or "utf-8"
+        raise
 
     soup = BeautifulSoup(response.text, "html.parser")
     channels: list[CatalogChannel] = []
@@ -52,7 +68,14 @@ def scrape_channels() -> list[CatalogChannel]:
             )
         )
 
-    LOGGER.debug("scrape channels duration_ms=%s channels=%s", round((perf_counter() - started_at) * 1000), len(channels))
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "scrape_channels_end",
+        channel_count=len(channels),
+        duration_ms=round((perf_counter() - started_at) * 1000),
+        **proxy_url_fields(url),
+    )
     return channels
 
 

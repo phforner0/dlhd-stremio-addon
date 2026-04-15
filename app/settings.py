@@ -17,6 +17,12 @@ ADDON_DESCRIPTION = os.getenv(
     "DLHD_ADDON_DESCRIPTION",
     "Scraped live channels and schedule grouped by country for Stremio.",
 )
+LOG_LEVEL = os.getenv("DLHD_LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = os.getenv("DLHD_LOG_FORMAT", "text").lower()
+LOG_REQUEST_START = _env_flag("DLHD_LOG_REQUEST_START", False)
+RESOURCE_LOG_ENABLED = _env_flag("DLHD_RESOURCE_LOG_ENABLED", True)
+RESOURCE_LOG_RSS_MB_THRESHOLD = int(os.getenv("DLHD_RESOURCE_LOG_RSS_MB_THRESHOLD", "350"))
+RESOURCE_LOG_INTERVAL_SECONDS = int(os.getenv("DLHD_RESOURCE_LOG_INTERVAL_SECONDS", "60"))
 
 HTTP_TIMEOUT_SECONDS = int(os.getenv("DLHD_HTTP_TIMEOUT", "20"))
 PROXY_MAX_REDIRECTS = int(os.getenv("DLHD_PROXY_MAX_REDIRECTS", "5"))
@@ -30,6 +36,12 @@ PROXY_ALLOWED_HOSTS = tuple(
                 ".dlstreams.top",
                 "embedkclx.sbs",
                 ".embedkclx.sbs",
+                "enviromentalspa2.sbs",
+                ".enviromentalspa2.sbs",
+                "viewembed.ru",
+                ".viewembed.ru",
+                "soyspace.cyou",
+                ".soyspace.cyou",
                 "vid.aivideox.site",
                 ".aivideox.site",
             ]

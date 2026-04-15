@@ -320,6 +320,12 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_LIVE_CHANNEL_CACHE_TTL`: per-channel live resolution cache TTL. Default: `120`
 - `DLHD_HLS_PLAYLIST_CACHE_TTL`: rewritten HLS playlist cache TTL. Default: `15`
 - `DLHD_FAILED_STREAM_CACHE_TTL`: currently used for local tuning only. Default: `30`
+- `DLHD_LOG_LEVEL`: application log level. Default: `INFO`
+- `DLHD_LOG_FORMAT`: `text` or `json`. Default: `text`
+- `DLHD_LOG_REQUEST_START`: emit `request_start` for every request. Default: `0`
+- `DLHD_RESOURCE_LOG_ENABLED`: enable periodic resource snapshots. Default: `1`
+- `DLHD_RESOURCE_LOG_RSS_MB_THRESHOLD`: warn when RSS first crosses this threshold. Default: `350`
+- `DLHD_RESOURCE_LOG_INTERVAL_SECONDS`: periodic resource snapshot interval. Default: `60`
 
 Production-oriented examples included:
 
@@ -328,3 +334,22 @@ Production-oriented examples included:
 - Railway production: [`deploy/railway/.env.production.example`](deploy/railway/.env.production.example)
 - Render: [`deploy/render/.env.example`](deploy/render/.env.example)
 - VPS: [`deploy/vps/.env.production.example`](deploy/vps/.env.production.example)
+
+## Logging
+
+Structured logs now use a shared schema so Railway logs can explain stream failures without exposing raw proxy URLs, referers, or config tokens.
+
+High-value events to watch:
+
+- `manifest_served`, `catalog_served`, `meta_served`, `stream_request_start`, `stream_request_end`
+  Request-level addon behavior with `request_id`, `route`, `status_code`, and config hash.
+- `stream_candidate_selected`, `stream_candidate_rejected`, `live_channel_selected`, `live_channel_rejected`
+  Channel/live resolution decisions. Rejections include reasons like `resolver_exception`, `watch_fetch_failed`, `duplicate_manifest`, and `invalid_hls_manifest`.
+- `proxy_request_start`, `proxy_url_rejected`, `proxy_redirect_allowed`, `proxy_redirect_rejected`, `proxy_playlist_cache_hit`, `proxy_playlist_rewrite`, `proxy_binary_passthrough`, `proxy_upstream_error`
+  `/proxy` diagnostics with upstream host/path families instead of full URLs.
+- `hls_validation_start`, `hls_validation_pass`, `hls_validation_fail`
+  HLS validation details for “no streams available” reports. Failure reasons include `not_extm3u`, `key_fetch_failed`, `media_missing`, `media_redirect_blocked`, `media_http_403`, `media_http_404`, and `media_html_instead_of_binary`.
+- `cache_hit`, `cache_miss`, `cache_stale_hit`, `cache_refresh_start`, `cache_refresh_end`, `cache_refresh_fail`
+  Cache behavior by cache name and key class.
+- `app_start`, `app_shutdown`, `resource_snapshot`
+  Startup knobs and memory/browser/session snapshots for operational debugging.

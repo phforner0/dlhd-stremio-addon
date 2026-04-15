@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 
 from app import settings
 from app.http import DEFAULT_HEADERS, build_session
+from app.logging_utils import log_event, proxy_url_fields
 from app.models import ManifestResult, PlayerResolution, WrapperCatalog
 
 LOGGER = logging.getLogger("dlhd.resolve")
@@ -20,11 +21,18 @@ LOGGER = logging.getLogger("dlhd.resolve")
 
 def _log_timing(message: str, started_at: float, **fields: object) -> None:
     elapsed_ms = round((time.perf_counter() - started_at) * 1000)
-    details = " ".join(f"{key}={value}" for key, value in fields.items())
-    if details:
-        LOGGER.debug("%s duration_ms=%s %s", message, elapsed_ms, details)
-    else:
-        LOGGER.debug("%s duration_ms=%s", message, elapsed_ms)
+    event = message.strip().lower().replace(" ", "_")
+    log_event(LOGGER, logging.DEBUG, event, duration_ms=elapsed_ms, **fields)
+
+
+def _resolve_log_fields(label: str, player_url: str, **extra: object) -> dict[str, object]:
+    return {
+        "label": label,
+        "player_host": urlparse(player_url).hostname,
+        "reused_browser": settings.PLAYWRIGHT_REUSE_BROWSER,
+        **proxy_url_fields(player_url),
+        **extra,
+    }
 
 
 def _host_matches(host: str, allowed: str) -> bool:
@@ -198,8 +206,6 @@ def _extract_embed_proxy_manifest_from_url(url: str, referer: str, timeout: int 
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return []
-    if "embedkclx.sbs" not in parsed.netloc or "/premiumtv/" not in parsed.path:
-        return []
 
     try:
         with build_session() as session:
@@ -365,7 +371,7 @@ def _mark_wait_signal(
 
 
 def _wait_for_resolution_window(page: Any, state: dict[str, Any], timeout_ms: int) -> None:
-    quick_wait_ms = min(3500, timeout_ms)
+    quick_wait_ms = min(5000, timeout_ms)
     quiet_wait_ms = 1000
     poll_ms = 200
     quick_deadline = state["started_at"] + (quick_wait_ms / 1000)
@@ -379,7 +385,7 @@ def _wait_for_resolution_window(page: Any, state: dict[str, Any], timeout_ms: in
         except Exception:
             pass
 
-        if state["signal_seen"]:
+        if state["verify_seen"] or state["lookup_seen"] or state["manifest_seen"]:
             if now - state["last_activity_at"] >= (quiet_wait_ms / 1000):
                 return
         elif now >= quick_deadline:
@@ -517,6 +523,10 @@ class PlaywrightResolver:
             else None
         )
 
+    def active_browser_count(self) -> int:
+        with self._browser_guard:
+            return len(self._thread_browsers)
+
     def close(self) -> None:
         if self._executor is not None:
             self._executor.shutdown(wait=True)
@@ -582,6 +592,14 @@ class PlaywrightResolver:
         with self._browser_guard:
             self._thread_browsers[threading.get_ident()] = state
 
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "playwright_browser_started",
+            reused_browser=settings.PLAYWRIGHT_REUSE_BROWSER,
+            active_browsers=self.active_browser_count(),
+        )
+
         return browser
 
     def _get_thread_browser(self) -> Any:
@@ -595,7 +613,14 @@ class PlaywrightResolver:
                         and state is not None
                         and state["uses"] >= settings.PLAYWRIGHT_BROWSER_MAX_USES
                     ):
-                        LOGGER.debug("recycling Playwright browser after max uses=%s", state["uses"])
+                        log_event(
+                            LOGGER,
+                            logging.INFO,
+                            "playwright_browser_recycled",
+                            reason="max_uses",
+                            uses=state["uses"],
+                            reused_browser=settings.PLAYWRIGHT_REUSE_BROWSER,
+                        )
                         self._drop_thread_browser()
                         return self._start_thread_browser()
 
@@ -604,7 +629,14 @@ class PlaywrightResolver:
                         and state is not None
                         and (time.monotonic() - state["last_used_at"]) >= settings.PLAYWRIGHT_BROWSER_MAX_IDLE_SECONDS
                     ):
-                        LOGGER.debug("recycling Playwright browser after idle_seconds=%s", round(time.monotonic() - state["last_used_at"], 2))
+                        log_event(
+                            LOGGER,
+                            logging.INFO,
+                            "playwright_browser_recycled",
+                            reason="idle",
+                            idle_seconds=round(time.monotonic() - state["last_used_at"], 2),
+                            reused_browser=settings.PLAYWRIGHT_REUSE_BROWSER,
+                        )
                         self._drop_thread_browser()
                         return self._start_thread_browser()
 
@@ -656,6 +688,21 @@ class PlaywrightResolver:
         iframe_seen_set: set[str] = set()
         inspected_iframe_urls: set[str] = set()
 
+        def _log_resolve_end(level: int = logging.INFO) -> None:
+            fields = _resolve_log_fields(
+                label,
+                player_url,
+                manifest_count=len(result.manifests),
+                iframe_count=len(result.iframes_seen),
+                duration_ms=round((time.perf_counter() - started_at) * 1000),
+                error=result.error,
+            )
+            log_event(LOGGER, level, "resolve_end", **fields)
+            if not result.manifests:
+                log_event(LOGGER, level, "resolve_no_manifest", **fields)
+
+        log_event(LOGGER, logging.INFO, "resolve_start", **_resolve_log_fields(label, player_url))
+
         self._semaphore.acquire()
         try:
             try:
@@ -685,12 +732,30 @@ class PlaywrightResolver:
                             locale="pt-BR",
                             ignore_https_errors=_should_ignore_https_errors(player_url),
                         )
+                        log_event(
+                            LOGGER,
+                            logging.DEBUG,
+                            "playwright_context_created",
+                            **_resolve_log_fields(label, player_url, ignore_https_errors=_should_ignore_https_errors(player_url)),
+                        )
                         break
-                    except Exception:
+                    except Exception as exc:
                         if settings.PLAYWRIGHT_REUSE_BROWSER and attempt == 0:
+                            log_event(
+                                LOGGER,
+                                logging.DEBUG,
+                                "playwright_context_failed",
+                                **_resolve_log_fields(label, player_url, reason=exc.__class__.__name__, retrying=True),
+                            )
                             self._drop_thread_browser()
                             browser = self._get_thread_browser()
                             continue
+                        log_event(
+                            LOGGER,
+                            logging.WARNING,
+                            "playwright_context_failed",
+                            **_resolve_log_fields(label, player_url, reason=exc.__class__.__name__, retrying=False),
+                        )
                         raise
 
                 if context is None:
@@ -741,9 +806,17 @@ class PlaywrightResolver:
                     result.player_final_url = page.url
                 except PWTimeout:
                     result.error = f"timeout while loading {player_url}"
+                    log_event(
+                        LOGGER,
+                        logging.WARNING,
+                        "resolve_timeout",
+                        **_resolve_log_fields(label, player_url, duration_ms=round((time.perf_counter() - started_at) * 1000)),
+                    )
+                    _log_resolve_end(logging.WARNING)
                     return result
                 except Exception as exc:  # noqa: BLE001
                     result.error = f"failed to open player: {exc}"
+                    _log_resolve_end(logging.WARNING)
                     return result
 
                 _wait_for_resolution_window(page, wait_state, settings.PLAYWRIGHT_WAIT_SECONDS * 1000)
@@ -776,12 +849,30 @@ class PlaywrightResolver:
 
                 player_host = urlparse(player_url).netloc
                 if not _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
+                    for iframe_url in iframes_seen:
+                        if not iframe_url.startswith("http"):
+                            continue
+                        _append_unique_hits(
+                            iframe_hits,
+                            iframe_seen_manifest_set,
+                            _hits(_extract_embed_proxy_manifest_from_url(iframe_url, page_url), iframe_url),
+                        )
+                        if _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
+                            break
+
+                if not _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
                     external_iframes = [
                         url for url in iframes_seen
                         if url.startswith("http") and urlparse(url).netloc != player_host and url not in inspected_iframe_urls
                     ]
 
                     for ext_url in external_iframes:
+                        log_event(
+                            LOGGER,
+                            logging.DEBUG,
+                            "iframe_external_followed",
+                            **_resolve_log_fields(label, player_url, iframe_host=urlparse(ext_url).hostname),
+                        )
                         ext_net: list[tuple[str, str]] = []
                         ext_net_seen: set[str] = set()
                         ext_page = context.new_page()
@@ -872,14 +963,7 @@ class PlaywrightResolver:
                     iframe_hits=iframe_hits,
                 )
                 result.iframes_seen = iframes_seen
-                _log_timing(
-                    "resolve player",
-                    started_at,
-                    label=label,
-                    manifests=len(result.manifests),
-                    iframes=len(result.iframes_seen),
-                    reused_browser=settings.PLAYWRIGHT_REUSE_BROWSER,
-                )
+                _log_resolve_end()
                 return result
             finally:
                 try:

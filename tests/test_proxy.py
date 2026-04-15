@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from app.main import app, playlist_cache
+from app.main import _host_allowed, app, playlist_cache
 
 
 class FakeResponse:
@@ -48,6 +48,13 @@ def test_proxy_rejects_disallowed_host() -> None:
     )
 
     assert response.status_code == 403
+
+
+def test_proxy_allowlist_includes_new_embed_hosts() -> None:
+    assert _host_allowed("enviromentalspa2.sbs") is True
+    assert _host_allowed("chevy.enviromentalspa2.sbs") is True
+    assert _host_allowed("viewembed.ru") is True
+    assert _host_allowed("chevy.soyspace.cyou") is True
 
 
 def test_proxy_rejects_private_ip(monkeypatch) -> None:

@@ -74,3 +74,8 @@ def close_pooled_sessions() -> None:
             session.close()
         except Exception:
             pass
+
+
+def pooled_session_count() -> int:
+    with _pooled_guard:
+        return len(_pooled_sessions)

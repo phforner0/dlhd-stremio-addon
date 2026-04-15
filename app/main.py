@@ -5,11 +5,14 @@ import base64
 from datetime import datetime, timezone
 import ipaddress
 import json
-from time import perf_counter
-import re
-from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 import logging
+import re
+import threading
 import socket
+from time import perf_counter
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
+
+import requests
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +21,16 @@ from starlette.responses import StreamingResponse
 
 from app import settings
 from app.cache import TTLCache
-from app.http import DEFAULT_HEADERS, build_session, close_pooled_sessions, get_pooled_session
+from app.http import DEFAULT_HEADERS, build_session, close_pooled_sessions, get_pooled_session, pooled_session_count
+from app.logging_utils import (
+    config_fingerprint,
+    configure_logging,
+    current_rss_mb,
+    log_event,
+    normalize_path_family,
+    proxy_url_fields,
+    request_id_from_request,
+)
 from app.manifest import build_manifest
 from app.models import CatalogChannel, LiveEvent, WrapperCatalog
 from app.posters import render_svg_poster
@@ -27,19 +39,57 @@ from app.scrape.channels import filter_channels, scrape_channels
 from app.scrape.schedule import _display_schedule_values, filter_schedule, scrape_schedule
 from app.scrape.watch import WatchFetchError, fetch_wrapper
 
+configure_logging()
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _log_app_start()
+    _log_resource_snapshot("startup")
+    _start_resource_logger()
     try:
         yield
     finally:
+        _stop_resource_logger()
+        _log_app_shutdown()
         resolver.close()
         close_pooled_sessions()
+        _log_resource_snapshot("shutdown")
 
 
 app = FastAPI(title=settings.ADDON_NAME, docs_url=None, redoc_url=None, lifespan=lifespan)
 LOGGER = logging.getLogger("dlhd.addon")
 HLS_URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
+
+channels_cache: TTLCache[list[CatalogChannel]] = TTLCache(max_entries=settings.CHANNELS_CACHE_MAX_ENTRIES, name="channels")
+channel_index_cache: TTLCache[dict[int, CatalogChannel]] = TTLCache(
+    max_entries=settings.CHANNEL_INDEX_CACHE_MAX_ENTRIES,
+    name="channel_index",
+)
+schedule_cache: TTLCache[list[LiveEvent]] = TTLCache(max_entries=settings.SCHEDULE_CACHE_MAX_ENTRIES, name="schedule")
+schedule_index_cache: TTLCache[dict[str, LiveEvent]] = TTLCache(
+    max_entries=settings.SCHEDULE_INDEX_CACHE_MAX_ENTRIES,
+    name="schedule_index",
+)
+watch_cache: TTLCache[WrapperCatalog] = TTLCache(max_entries=settings.WATCH_CACHE_MAX_ENTRIES, name="watch")
+stream_cache: TTLCache[list[dict]] = TTLCache(max_entries=settings.STREAM_CACHE_MAX_ENTRIES, name="stream")
+live_channel_stream_cache: TTLCache[dict[str, str]] = TTLCache(
+    max_entries=settings.LIVE_CHANNEL_CACHE_MAX_ENTRIES,
+    name="live_channel",
+)
+playlist_cache: TTLCache[str] = TTLCache(max_entries=settings.HLS_PLAYLIST_CACHE_MAX_ENTRIES, name="playlist")
+manifest_validation_cache: TTLCache[bool] = TTLCache(
+    max_entries=settings.HLS_VALIDATION_MAX_ENTRIES,
+    name="manifest_validation",
+)
+manifest_validation_reason_cache: TTLCache[str] = TTLCache(
+    max_entries=settings.HLS_VALIDATION_MAX_ENTRIES,
+    name="manifest_validation_reason",
+)
+resolver = PlaywrightResolver()
+RESOURCE_LOG_STOP = threading.Event()
+RESOURCE_LOG_THREAD: threading.Thread | None = None
+RESOURCE_THRESHOLD_EMITTED = False
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,25 +100,149 @@ app.add_middleware(
     max_age=86400,
 )
 
-channels_cache: TTLCache[list[CatalogChannel]] = TTLCache(max_entries=settings.CHANNELS_CACHE_MAX_ENTRIES)
-channel_index_cache: TTLCache[dict[int, CatalogChannel]] = TTLCache(max_entries=settings.CHANNEL_INDEX_CACHE_MAX_ENTRIES)
-schedule_cache: TTLCache[list[LiveEvent]] = TTLCache(max_entries=settings.SCHEDULE_CACHE_MAX_ENTRIES)
-schedule_index_cache: TTLCache[dict[str, LiveEvent]] = TTLCache(max_entries=settings.SCHEDULE_INDEX_CACHE_MAX_ENTRIES)
-watch_cache: TTLCache[WrapperCatalog] = TTLCache(max_entries=settings.WATCH_CACHE_MAX_ENTRIES)
-stream_cache: TTLCache[list[dict]] = TTLCache(max_entries=settings.STREAM_CACHE_MAX_ENTRIES)
-live_channel_stream_cache: TTLCache[dict[str, str]] = TTLCache(max_entries=settings.LIVE_CHANNEL_CACHE_MAX_ENTRIES)
-playlist_cache: TTLCache[str] = TTLCache(max_entries=settings.HLS_PLAYLIST_CACHE_MAX_ENTRIES)
-manifest_validation_cache: TTLCache[bool] = TTLCache(max_entries=settings.HLS_VALIDATION_MAX_ENTRIES)
-resolver = PlaywrightResolver()
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = request_id_from_request(request)
+    started_at = perf_counter()
+    if settings.LOG_REQUEST_START:
+        log_event(LOGGER, logging.INFO, "request_start", **_request_log_fields(request))
+
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-Id"] = request_id
+        return response
+    except HTTPException as exc:
+        status_code = exc.status_code
+        raise
+    finally:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "request_end",
+            **_request_log_fields(
+                request,
+                status_code=status_code,
+                duration_ms=round((perf_counter() - started_at) * 1000),
+            ),
+        )
 
 
 def _log_timing(message: str, started_at: float, **fields: object) -> None:
     elapsed_ms = round((perf_counter() - started_at) * 1000)
-    details = " ".join(f"{key}={value}" for key, value in fields.items())
-    if details:
-        LOGGER.debug("%s duration_ms=%s %s", message, elapsed_ms, details)
+    event = message.strip().lower().replace(" ", "_")
+    log_event(LOGGER, logging.DEBUG, event, duration_ms=elapsed_ms, **fields)
+
+
+def _route_family(request: Request) -> str:
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if isinstance(route_path, str):
+        return route_path
+    return normalize_path_family(request.url.path) or request.url.path
+
+
+def _request_log_fields(request: Request, **extra: object) -> dict[str, object]:
+    return {
+        "request_id": request_id_from_request(request),
+        "route": _route_family(request),
+        "method": request.method,
+        **extra,
+    }
+
+
+def _cache_counts() -> dict[str, int]:
+    return {
+        "channels_entries": channels_cache.entry_count(),
+        "schedule_entries": schedule_cache.entry_count(),
+        "watch_entries": watch_cache.entry_count(),
+        "stream_entries": stream_cache.entry_count(),
+        "live_channel_entries": live_channel_stream_cache.entry_count(),
+        "playlist_entries": playlist_cache.entry_count(),
+        "manifest_validation_entries": manifest_validation_cache.entry_count(),
+    }
+
+
+def _resource_snapshot_fields() -> dict[str, object]:
+    return {
+        "rss_mb": current_rss_mb(),
+        "active_browsers": resolver.active_browser_count(),
+        "pooled_http_sessions": pooled_session_count(),
+        **_cache_counts(),
+    }
+
+
+def _log_resource_snapshot(reason: str, *, level: int = logging.INFO) -> None:
+    global RESOURCE_THRESHOLD_EMITTED
+
+    fields = _resource_snapshot_fields()
+    rss_mb = fields.get("rss_mb")
+    log_event(LOGGER, level, "resource_snapshot", reason=reason, **fields)
+
+    if isinstance(rss_mb, (int, float)) and rss_mb >= settings.RESOURCE_LOG_RSS_MB_THRESHOLD:
+        if not RESOURCE_THRESHOLD_EMITTED:
+            RESOURCE_THRESHOLD_EMITTED = True
+            log_event(LOGGER, logging.WARNING, "resource_snapshot", reason="rss_threshold_crossed", **fields)
     else:
-        LOGGER.debug("%s duration_ms=%s", message, elapsed_ms)
+        RESOURCE_THRESHOLD_EMITTED = False
+
+
+def _resource_logger_loop() -> None:
+    interval = max(settings.RESOURCE_LOG_INTERVAL_SECONDS, 1)
+    while not RESOURCE_LOG_STOP.wait(interval):
+        _log_resource_snapshot("interval", level=logging.DEBUG)
+
+
+def _start_resource_logger() -> None:
+    global RESOURCE_LOG_THREAD
+
+    RESOURCE_LOG_STOP.clear()
+    if not settings.RESOURCE_LOG_ENABLED or settings.RESOURCE_LOG_INTERVAL_SECONDS <= 0:
+        return
+
+    RESOURCE_LOG_THREAD = threading.Thread(target=_resource_logger_loop, name="resource-logger", daemon=True)
+    RESOURCE_LOG_THREAD.start()
+
+
+def _stop_resource_logger() -> None:
+    RESOURCE_LOG_STOP.set()
+    if RESOURCE_LOG_THREAD is not None:
+        RESOURCE_LOG_THREAD.join(timeout=1)
+
+
+def _log_app_start() -> None:
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "app_start",
+        version=settings.ADDON_VERSION,
+        playwright_max_concurrency=settings.PLAYWRIGHT_MAX_CONCURRENCY,
+        playwright_reuse_browser=settings.PLAYWRIGHT_REUSE_BROWSER,
+        channel_stream_max_attempts=settings.CHANNEL_STREAM_MAX_ATTEMPTS,
+        live_stream_max_attempts=settings.LIVE_STREAM_MAX_ATTEMPTS,
+        live_stream_budget_seconds=settings.LIVE_STREAM_BUDGET_SECONDS,
+        proxy_allowed_hosts=list(settings.PROXY_ALLOWED_HOSTS),
+        proxy_max_redirects=settings.PROXY_MAX_REDIRECTS,
+        http_pool_connections=settings.HTTP_POOL_CONNECTIONS,
+        http_pool_maxsize=settings.HTTP_POOL_MAXSIZE,
+        safe_http_retry_total=settings.SAFE_HTTP_RETRY_TOTAL,
+        safe_http_retry_backoff_seconds=settings.SAFE_HTTP_RETRY_BACKOFF_SECONDS,
+        tls_ignore_global=settings.PLAYWRIGHT_IGNORE_HTTPS_ERRORS,
+        tls_ignore_hosts=list(settings.PLAYWRIGHT_IGNORE_HTTPS_ERROR_HOSTS),
+        channels_cache_max_entries=settings.CHANNELS_CACHE_MAX_ENTRIES,
+        schedule_cache_max_entries=settings.SCHEDULE_CACHE_MAX_ENTRIES,
+        watch_cache_max_entries=settings.WATCH_CACHE_MAX_ENTRIES,
+        stream_cache_max_entries=settings.STREAM_CACHE_MAX_ENTRIES,
+        live_channel_cache_max_entries=settings.LIVE_CHANNEL_CACHE_MAX_ENTRIES,
+        playlist_cache_max_entries=settings.HLS_PLAYLIST_CACHE_MAX_ENTRIES,
+        hls_validation_cache_max_entries=settings.HLS_VALIDATION_MAX_ENTRIES,
+    )
+
+
+def _log_app_shutdown() -> None:
+    log_event(LOGGER, logging.INFO, "app_shutdown", **_resource_snapshot_fields())
 
 
 def _service_base_url(request: Request) -> str:
@@ -77,6 +251,10 @@ def _service_base_url(request: Request) -> str:
 
 def _playlist_cache_key(base_url: str, url: str, referer: str) -> str:
     return f"playlist:{base_url}|{url}|{referer}"
+
+
+def _hls_validation_cache_key(manifest_url: str, referer: str) -> str:
+    return f"hls-valid:{manifest_url}|{referer}"
 
 
 def _host_allowed(host: str) -> bool:
@@ -114,33 +292,50 @@ def _public_host(host: str) -> bool:
     return True
 
 
-def _validate_proxy_url(raw_url: str, field_name: str) -> str:
+def _proxy_url_error(raw_url: str) -> tuple[int | None, str | None]:
     parsed = urlparse(raw_url)
     if parsed.scheme not in {"http", "https"}:
-        raise HTTPException(status_code=400, detail=f"invalid {field_name} scheme")
+        return 400, "invalid_scheme"
     if not parsed.hostname:
-        raise HTTPException(status_code=400, detail=f"invalid {field_name} host")
+        return 400, "invalid_host"
     if not _host_allowed(parsed.hostname):
-        raise HTTPException(status_code=403, detail=f"disallowed {field_name} host")
+        return 403, "host_not_allowlisted"
     if not _public_host(parsed.hostname):
+        return 403, "private_ip_blocked"
+    return None, None
+
+
+def _validate_proxy_url(raw_url: str, field_name: str) -> str:
+    status_code, reason = _proxy_url_error(raw_url)
+    if reason == "invalid_scheme":
+        raise HTTPException(status_code=400, detail=f"invalid {field_name} scheme")
+    if reason == "invalid_host":
+        raise HTTPException(status_code=400, detail=f"invalid {field_name} host")
+    if reason == "host_not_allowlisted":
+        raise HTTPException(status_code=403, detail=f"disallowed {field_name} host")
+    if reason == "private_ip_blocked":
         raise HTTPException(status_code=403, detail=f"disallowed {field_name} address")
+    if status_code is not None:
+        raise HTTPException(status_code=status_code, detail=f"invalid {field_name}")
     return raw_url
 
 
-def _allow_proxy_redirect(current_url: str, target_url: str) -> bool:
+def _proxy_redirect_decision(current_url: str, target_url: str) -> tuple[bool, str | None, str | None]:
     current = urlparse(current_url)
     target = urlparse(target_url)
     if not target.hostname or target.scheme not in {"http", "https"}:
-        return False
+        return False, "redirect_host_blocked", None
     if not _public_host(target.hostname):
-        return False
+        return False, "redirect_private_ip", None
     if _host_allowed(target.hostname):
-        return True
+        return True, None, "allowlisted_host"
 
     if current.hostname and _host_allowed(current.hostname) and current.path.startswith("/redirect/media/"):
-        return target.path.startswith("/media/")
+        if target.path.startswith("/media/"):
+            return True, None, "media_chain"
+        return False, "redirect_host_blocked", "media_chain"
 
-    return False
+    return False, "redirect_host_blocked", None
 
 
 def _parse_skip(raw_skip: str | None) -> int:
@@ -196,52 +391,96 @@ def _is_hls_playlist_candidate(url: str, content_type: str) -> bool:
     )
 
 
-def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> bool:
+def _hls_validation_reason(manifest_url: str, referer: str) -> str | None:
+    return manifest_validation_reason_cache.get(_hls_validation_cache_key(manifest_url, referer), allow_stale=True)
+
+
+def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> tuple[bool, str | None]:
     if depth > 2:
-        return False
+        log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="media_missing", depth=depth, **proxy_url_fields(url))
+        return False, "media_missing"
 
     session = build_session()
     try:
         headers = {"Referer": referer}
+        log_event(LOGGER, logging.DEBUG, "hls_validation_start", depth=depth, **proxy_url_fields(url))
         response = _follow_proxy_redirects(session, url, headers)
         response.raise_for_status()
         content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
 
         if content_type in {"application/json", "text/html"}:
             response.close()
-            return False
+            reason = "media_html_instead_of_binary" if content_type == "text/html" else "playlist_candidate_not_hls"
+            log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason=reason, depth=depth, **proxy_url_fields(response.url))
+            return False, reason
 
         if _is_hls_playlist_candidate(response.url, content_type):
             body = response.text
             response.close()
             if not _looks_like_hls_playlist(body):
-                return False
+                log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="not_extm3u", depth=depth, **proxy_url_fields(url))
+                return False, "not_extm3u"
 
             key_url, media_url = _extract_hls_probe_targets(body, response.url)
             if key_url is not None:
-                key_response = _follow_proxy_redirects(session, key_url, headers)
-                key_response.raise_for_status()
-                key_response.close()
+                try:
+                    key_response = _follow_proxy_redirects(session, key_url, headers)
+                    key_response.raise_for_status()
+                    key_response.close()
+                except HTTPException:
+                    log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="media_redirect_blocked", depth=depth, **proxy_url_fields(key_url))
+                    return False, "media_redirect_blocked"
+                except requests.HTTPError:
+                    log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="key_fetch_failed", depth=depth, **proxy_url_fields(key_url))
+                    return False, "key_fetch_failed"
             if media_url is None:
-                return False
+                log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="media_missing", depth=depth, **proxy_url_fields(response.url))
+                return False, "media_missing"
             return _probe_hls_target(media_url, referer, depth=depth + 1)
 
         response.close()
-        return True
-    except Exception:
-        return False
+        log_event(LOGGER, logging.DEBUG, "hls_validation_pass", depth=depth, **proxy_url_fields(url))
+        return True, None
+    except HTTPException:
+        log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="media_redirect_blocked", depth=depth, **proxy_url_fields(url))
+        return False, "media_redirect_blocked"
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 403:
+            reason = "media_http_403"
+        elif status_code == 404:
+            reason = "media_http_404"
+        else:
+            reason = "validation_exception"
+        log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason=reason, status_code=status_code, depth=depth, **proxy_url_fields(url))
+        return False, reason
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "hls_validation_fail",
+            reason="validation_exception",
+            error=exc.__class__.__name__,
+            depth=depth,
+            **proxy_url_fields(url),
+        )
+        return False, "validation_exception"
     finally:
         session.close()
 
 
 def _valid_hls_stream(manifest_url: str, referer: str) -> bool:
-    cache_key = f"hls-valid:{manifest_url}|{referer}"
+    cache_key = _hls_validation_cache_key(manifest_url, referer)
     cached = manifest_validation_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    valid = _probe_hls_target(manifest_url, referer)
+    valid, reason = _probe_hls_target(manifest_url, referer)
     manifest_validation_cache.set(cache_key, valid, settings.HLS_VALIDATION_TTL_SECONDS)
+    if reason:
+        manifest_validation_reason_cache.set(cache_key, reason, settings.HLS_VALIDATION_TTL_SECONDS)
+    else:
+        manifest_validation_reason_cache.delete(cache_key)
     return valid
 
 
@@ -690,7 +929,7 @@ def _proxy_media_url(
     return f"{_service_base_url(request)}/proxy/{safe_filename}?{query}"
 
 
-def _follow_proxy_redirects(session, url: str, headers: dict[str, str]):
+def _follow_proxy_redirects(session, url: str, headers: dict[str, str], *, log_fields: dict[str, object] | None = None):
     current_url = _validate_proxy_url(url, "url")
     response = None
     for _ in range(settings.PROXY_MAX_REDIRECTS + 1):
@@ -705,13 +944,37 @@ def _follow_proxy_redirects(session, url: str, headers: dict[str, str]):
         if 300 <= response.status_code < 400 and response.headers.get("Location"):
             location = urljoin(current_url, response.headers["Location"])
             response.close()
-            if not _allow_proxy_redirect(current_url, location):
+            allowed, reason, redirect_kind = _proxy_redirect_decision(current_url, location)
+            if not allowed:
+                if log_fields is not None:
+                    log_event(
+                        LOGGER,
+                        logging.WARNING,
+                        "proxy_redirect_rejected",
+                        **log_fields,
+                        from_host=urlparse(current_url).hostname,
+                        to_host=urlparse(location).hostname,
+                        redirect_kind=redirect_kind,
+                        reason=reason,
+                    )
                 raise HTTPException(status_code=403, detail="disallowed redirect host")
+            if log_fields is not None:
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "proxy_redirect_allowed",
+                    **log_fields,
+                    from_host=urlparse(current_url).hostname,
+                    to_host=urlparse(location).hostname,
+                    redirect_kind=redirect_kind,
+                )
             current_url = location
             continue
 
         return response
 
+    if log_fields is not None:
+        log_event(LOGGER, logging.WARNING, "proxy_redirect_rejected", **log_fields, reason="too_many_redirects")
     raise HTTPException(status_code=502, detail="too many upstream redirects")
 
 
@@ -784,7 +1047,14 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
         try:
             wrapper = get_wrapper(channel.channel_id)
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Channel stream resolution failed for %s: %s", channel.channel_id, exc)
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "stream_candidate_rejected",
+                channel_id=channel.channel_id,
+                reason="watch_fetch_failed",
+                error=exc.__class__.__name__,
+            )
             return []
 
         targets = _ordered_player_targets(wrapper)
@@ -792,24 +1062,76 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
         streams: list[dict] = []
         seen_urls: set[str] = set()
         for label, player_url in targets[:settings.CHANNEL_STREAM_MAX_ATTEMPTS]:
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "channel_player_attempt",
+                channel_id=channel.channel_id,
+                provider=label,
+                player_host=urlparse(player_url).hostname,
+            )
             try:
                 resolution = resolver.resolve_player(label, player_url)
             except Exception as exc:  # noqa: BLE001
-                LOGGER.warning(
-                    "Channel player resolution failed for %s (%s): %s",
-                    channel.channel_id,
-                    player_url,
-                    exc,
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "stream_candidate_rejected",
+                    channel_id=channel.channel_id,
+                    provider=label,
+                    reason="resolver_exception",
+                    error=exc.__class__.__name__,
+                    player_host=urlparse(player_url).hostname,
                 )
                 continue
 
+            if not resolution.manifests:
+                log_event(
+                    LOGGER,
+                    logging.DEBUG,
+                    "stream_candidate_rejected",
+                    channel_id=channel.channel_id,
+                    provider=resolution.label,
+                    reason="no_manifests",
+                    player_host=urlparse(player_url).hostname,
+                )
+
             for manifest in resolution.manifests:
                 if manifest.url in seen_urls:
+                    log_event(
+                        LOGGER,
+                        logging.DEBUG,
+                        "stream_candidate_rejected",
+                        channel_id=channel.channel_id,
+                        provider=resolution.label,
+                        reason="duplicate_manifest",
+                        stream_kind=manifest.player_type,
+                        **proxy_url_fields(manifest.url),
+                    )
                     continue
                 if manifest.player_type.lower() == "hls" and not _valid_hls_stream(manifest.url, manifest.found_at_url):
-                    LOGGER.warning("Skipping invalid HLS manifest for channel %s: %s", channel.channel_id, manifest.url)
+                    log_event(
+                        LOGGER,
+                        logging.WARNING,
+                        "stream_candidate_rejected",
+                        channel_id=channel.channel_id,
+                        provider=resolution.label,
+                        reason="invalid_hls_manifest",
+                        hls_reason=_hls_validation_reason(manifest.url, manifest.found_at_url),
+                        stream_kind=manifest.player_type,
+                        **proxy_url_fields(manifest.url),
+                    )
                     continue
                 seen_urls.add(manifest.url)
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "stream_candidate_selected",
+                    channel_id=channel.channel_id,
+                    provider=resolution.label,
+                    stream_kind=manifest.player_type,
+                    **proxy_url_fields(manifest.url),
+                )
                 streams.append(
                     _manifest_to_stream(
                         request=request,
@@ -842,18 +1164,18 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
     )
 
 
-def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
+def _get_live_channel_payload(linked_channel) -> tuple[dict[str, str] | None, str | None]:
     cache_key = f"live-channel:{linked_channel.channel_id}"
     cached = live_channel_stream_cache.get(cache_key)
     if cached is not None:
-        return cached
+        return cached, None
 
     started_at = perf_counter()
 
     try:
         wrapper = get_wrapper(linked_channel.channel_id)
     except Exception:
-        return None
+        return None, "watch_fetch_failed"
 
     try:
         resolutions = resolver.resolve_wrapper(
@@ -861,13 +1183,8 @@ def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
             resolve_all=False,
             stop_after_first_success=True,
         )
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning(
-            "Live channel resolution failed for channel %s: %s",
-            linked_channel.channel_id,
-            exc,
-        )
-        return None
+    except Exception:  # noqa: BLE001
+        return None, "resolver_exception"
 
     for resolution in resolutions:
         if not resolution.manifests:
@@ -884,19 +1201,54 @@ def _get_live_channel_payload(linked_channel) -> dict[str, str] | None:
             settings.LIVE_CHANNEL_CACHE_TTL_SECONDS,
         )
         _log_timing("live channel resolve", started_at, channel_id=linked_channel.channel_id, success=True)
-        return payload
+        return payload, None
 
     _log_timing("live channel resolve", started_at, channel_id=linked_channel.channel_id, success=False)
-    return None
+    return None, "no_manifests"
 
 
 def _resolve_live_channel_stream(event: LiveEvent, linked_channel, request: Request) -> dict | None:
-    payload = _get_live_channel_payload(linked_channel)
+    log_event(
+        LOGGER,
+        logging.DEBUG,
+        "live_channel_attempt",
+        event_id=event.meta_id,
+        channel_id=linked_channel.channel_id,
+    )
+    payload, rejection_reason = _get_live_channel_payload(linked_channel)
     if not payload:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "live_channel_rejected",
+            event_id=event.meta_id,
+            channel_id=linked_channel.channel_id,
+            reason=rejection_reason,
+        )
         return None
     if payload["player_type"].lower() == "hls" and not _valid_hls_stream(payload["url"], payload["referer"]):
-        LOGGER.warning("Skipping invalid live HLS manifest for channel %s: %s", linked_channel.channel_id, payload["url"])
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "live_channel_rejected",
+            event_id=event.meta_id,
+            channel_id=linked_channel.channel_id,
+            reason="invalid_hls_manifest",
+            hls_reason=_hls_validation_reason(payload["url"], payload["referer"]),
+            stream_kind=payload["player_type"],
+            **proxy_url_fields(payload["url"]),
+        )
         return None
+
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "live_channel_selected",
+        event_id=event.meta_id,
+        channel_id=linked_channel.channel_id,
+        stream_kind=payload["player_type"],
+        **proxy_url_fields(payload["url"]),
+    )
 
     return _manifest_to_stream(
         request=request,
@@ -922,11 +1274,14 @@ def _build_live_streams(event: LiveEvent, request: Request, config: dict[str, st
         max_workers = max(1, min(settings.LIVE_STREAM_MAX_WORKERS, len(attempt_channels)))
         for offset in range(0, len(attempt_channels), max_workers):
             if perf_counter() - started_at >= settings.LIVE_STREAM_BUDGET_SECONDS:
-                _log_timing(
-                    "live event budget exhausted",
-                    started_at,
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "live_event_budget_exhausted",
                     event_id=event.meta_id,
                     streams=len(streams),
+                    reason="budget_exhausted",
+                    duration_ms=round((perf_counter() - started_at) * 1000),
                 )
                 break
 
@@ -936,6 +1291,14 @@ def _build_live_streams(event: LiveEvent, request: Request, config: dict[str, st
                 if not stream:
                     continue
                 if stream["url"] in seen_urls:
+                    log_event(
+                        LOGGER,
+                        logging.DEBUG,
+                        "live_channel_rejected",
+                        event_id=event.meta_id,
+                        channel_id=linked_channel.channel_id,
+                        reason="duplicate_manifest",
+                    )
                     continue
 
                 seen_urls.add(stream["url"])
@@ -984,7 +1347,19 @@ def healthz() -> dict:
 @app.get("/{config}/manifest.json")
 def manifest(request: Request, config: str | None = None) -> JSONResponse:
     user_config = _parse_user_config(config)
-    return JSONResponse(build_manifest(_service_base_url(request), configured=bool(user_config), user_config=user_config))
+    manifest_payload = build_manifest(_service_base_url(request), configured=bool(user_config), user_config=user_config)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "manifest_served",
+        **_request_log_fields(
+            request,
+            configured=bool(user_config),
+            catalog_count=len(manifest_payload["catalogs"]),
+            user_config_hash=config_fingerprint(user_config),
+        ),
+    )
+    return JSONResponse(manifest_payload)
 
 
 @app.head("/manifest.json")
@@ -1003,11 +1378,13 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None, config:
     user_config = _parse_user_config(config)
     search = extra_props.get("search") or None
     skip = _parse_skip(extra_props.get("skip"))
+    country_filter = _effective_country_filter(catalog_def, user_config)
+    stale_after_minutes = _event_stale_after_minutes(user_config)
 
     if catalog_def["kind"] == "channels":
         items = filter_channels(
             get_channels(),
-            country_code=_effective_country_filter(catalog_def, user_config),
+            country_code=country_filter,
             search=search,
             skip=skip,
         )
@@ -1015,12 +1392,35 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None, config:
     else:
         items = filter_schedule(
             get_schedule(),
-            country_code=_effective_country_filter(catalog_def, user_config),
+            country_code=country_filter,
             search=search,
             skip=skip,
-            stale_after_minutes=_event_stale_after_minutes(user_config),
+            stale_after_minutes=stale_after_minutes,
         )
         metas = [_event_preview(event, request, user_config) for event in items]
+
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "catalog_served",
+        **_request_log_fields(
+            request,
+            catalog_id=catalog_id,
+            search=search,
+            skip=skip,
+            result_count=len(metas),
+            country_filter=country_filter,
+            stale_after_minutes=stale_after_minutes if catalog_def["kind"] == "live" else None,
+            user_config_hash=config_fingerprint(user_config),
+        ),
+    )
+    if not metas:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "catalog_empty",
+            **_request_log_fields(request, catalog_id=catalog_id, search=search, skip=skip, country_filter=country_filter),
+        )
 
     return JSONResponse({"metas": metas})
 
@@ -1030,13 +1430,18 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None, config:
 def meta(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
     user_config = _parse_user_config(config)
+    request_fields = _request_log_fields(request, meta_id=meta_id, user_config_hash=config_fingerprint(user_config))
     if kind == "channel":
         channel_id = value
         channel_index = get_channel_index()
         channel = channel_index.get(channel_id)
         wrapper = watch_cache.get(f"watch:{channel_id}")
         if channel is None:
-            wrapper = wrapper or _wrapper_or_http_error(channel_id)
+            try:
+                wrapper = wrapper or _wrapper_or_http_error(channel_id)
+            except HTTPException:
+                log_event(LOGGER, logging.WARNING, "meta_not_found", **request_fields, kind=kind, channel_id=channel_id)
+                raise
             channel = CatalogChannel(
                 channel_id=channel_id,
                 name=wrapper.channel.name or wrapper.page.title or f"Channel {channel_id}",
@@ -1063,10 +1468,12 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
             "videos": [_default_video(channel.meta_id, channel.name)],
             "behaviorHints": {"defaultVideoId": channel.meta_id},
         }
+        log_event(LOGGER, logging.INFO, "meta_served", **request_fields, kind=kind, channel_id=channel_id)
         return JSONResponse({"meta": meta_payload})
 
     event = _find_event(value)
     if event is None:
+        log_event(LOGGER, logging.WARNING, "meta_not_found", **request_fields, kind=kind, event_id=value)
         raise HTTPException(status_code=404, detail="event not found")
     event_day_label, event_time_text = _event_display_values(event, user_config)
 
@@ -1085,6 +1492,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
         "videos": [_default_video(event.meta_id, event.title)],
         "behaviorHints": {"defaultVideoId": event.meta_id},
     }
+    log_event(LOGGER, logging.INFO, "meta_served", **request_fields, kind=kind, event_id=event.meta_id)
     return JSONResponse({"meta": meta_payload})
 
 
@@ -1093,10 +1501,16 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
 def stream(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
     user_config = _parse_user_config(config)
+    request_fields = _request_log_fields(request, meta_id=meta_id, user_config_hash=config_fingerprint(user_config), kind=kind)
+    log_event(LOGGER, logging.INFO, "stream_request_start", **request_fields)
     if kind == "channel":
         channel = get_cached_channel(value)
         if channel is None:
-            wrapper = _wrapper_or_http_error(value)
+            try:
+                wrapper = _wrapper_or_http_error(value)
+            except HTTPException:
+                log_event(LOGGER, logging.WARNING, "stream_request_end", **request_fields, channel_id=value, stream_count=0, status_code=404)
+                raise
             channel = CatalogChannel(
                 channel_id=value,
                 name=wrapper.channel.name or wrapper.page.title or f"Channel {value}",
@@ -1107,12 +1521,36 @@ def stream(request: Request, meta_id: str, config: str | None = None) -> JSONRes
                 country_label=settings.COUNTRY_LABELS["global"],
             )
         streams = _build_channel_streams(channel, request, user_config)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "stream_request_end",
+            **request_fields,
+            channel_id=channel.channel_id,
+            stream_count=len(streams),
+            status_code=200,
+        )
+        if not streams:
+            log_event(LOGGER, logging.INFO, "stream_no_results", **request_fields, channel_id=channel.channel_id)
         return JSONResponse({"streams": streams})
 
     event = _find_event(value)
     if event is None:
+        log_event(LOGGER, logging.WARNING, "stream_request_end", **request_fields, event_id=value, stream_count=0, status_code=404)
         raise HTTPException(status_code=404, detail="event not found")
-    return JSONResponse({"streams": _build_live_streams(event, request, user_config)})
+    streams = _build_live_streams(event, request, user_config)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "stream_request_end",
+        **request_fields,
+        event_id=event.meta_id,
+        stream_count=len(streams),
+        status_code=200,
+    )
+    if not streams:
+        log_event(LOGGER, logging.INFO, "stream_no_results", **request_fields, event_id=event.meta_id)
+    return JSONResponse({"streams": streams})
 
 
 @app.get("/proxy/{filename:path}")
@@ -1123,14 +1561,63 @@ def proxy_media(
     referer: str = Query(...),
 ) -> Response:
     started_at = perf_counter()
-    validated_url = _validate_proxy_url(url, "url")
-    validated_referer = _validate_proxy_url(referer, "referer")
+    request_fields = _request_log_fields(request, filename=filename)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "proxy_request_start",
+        **request_fields,
+        upstream_host=urlparse(url).hostname,
+        referer_host=urlparse(referer).hostname,
+    )
+
+    try:
+        validated_url = _validate_proxy_url(url, "url")
+    except HTTPException as exc:
+        _, reason = _proxy_url_error(url)
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "proxy_url_rejected",
+            **request_fields,
+            field="url",
+            reason=reason,
+            status_code=exc.status_code,
+            **proxy_url_fields(url),
+        )
+        raise
+
+    try:
+        validated_referer = _validate_proxy_url(referer, "referer")
+    except HTTPException as exc:
+        _, reason = _proxy_url_error(referer)
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "proxy_url_rejected",
+            **request_fields,
+            field="referer",
+            reason=reason,
+            status_code=exc.status_code,
+            referer_host=urlparse(referer).hostname,
+        )
+        raise
+
     playlist_cache_key = None
     if filename.lower().endswith(".m3u8"):
         playlist_cache_key = _playlist_cache_key(_service_base_url(request), validated_url, validated_referer)
         cached_playlist = playlist_cache.get(playlist_cache_key)
         if cached_playlist is not None:
-            _log_timing("proxy playlist cache hit", started_at, filename=filename)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "proxy_playlist_cache_hit",
+                **request_fields,
+                duration_ms=round((perf_counter() - started_at) * 1000),
+                cache_name="playlist",
+                cache_status="hit",
+                **proxy_url_fields(validated_url),
+            )
             return Response(content=cached_playlist, media_type="application/vnd.apple.mpegurl")
 
     session = get_pooled_session()
@@ -1140,8 +1627,22 @@ def proxy_media(
     if range_header:
         headers["Range"] = range_header
 
-    upstream = _follow_proxy_redirects(session, validated_url, headers)
-    upstream.raise_for_status()
+    try:
+        upstream = _follow_proxy_redirects(session, validated_url, headers, log_fields=request_fields)
+        upstream.raise_for_status()
+    except requests.RequestException as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "proxy_upstream_error",
+            **request_fields,
+            status_code=status_code,
+            reason=exc.__class__.__name__,
+            **proxy_url_fields(validated_url),
+        )
+        raise
+
     content_type = upstream.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
 
     if playlist_cache_key is not None:
@@ -1149,7 +1650,15 @@ def proxy_media(
         upstream.close()
 
         if not _looks_like_hls_playlist(body):
-            _log_timing("proxy non-hls playlist passthrough", started_at, filename=filename)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "proxy_non_hls_passthrough",
+                **request_fields,
+                duration_ms=round((perf_counter() - started_at) * 1000),
+                content_type=content_type or "text/plain",
+                **proxy_url_fields(upstream.url),
+            )
             return Response(content=body, media_type=content_type or "text/plain")
 
         rewritten = _rewrite_hls_playlist(request, body, upstream.url, validated_referer)
@@ -1158,7 +1667,15 @@ def proxy_media(
             rewritten,
             settings.HLS_PLAYLIST_CACHE_TTL_SECONDS,
         )
-        _log_timing("proxy playlist rewrite", started_at, filename=filename)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "proxy_playlist_rewrite",
+            **request_fields,
+            duration_ms=round((perf_counter() - started_at) * 1000),
+            cache_name="playlist",
+            **proxy_url_fields(upstream.url),
+        )
         return Response(content=rewritten, media_type="application/vnd.apple.mpegurl")
 
     response_headers = {}
@@ -1169,6 +1686,17 @@ def proxy_media(
 
     if content_type in {"application/javascript", "text/javascript", "text/plain", "text/txt"}:
         content_type = "application/octet-stream"
+
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "proxy_binary_passthrough",
+        **request_fields,
+        duration_ms=round((perf_counter() - started_at) * 1000),
+        status_code=upstream.status_code,
+        content_type=content_type,
+        **proxy_url_fields(upstream.url),
+    )
 
     return StreamingResponse(
         _stream_upstream(upstream),

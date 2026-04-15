@@ -45,6 +45,7 @@ jobs:
           base = "http://127.0.0.1:7000"
 
           def get_json(path: str) -> dict:
+              print(f"GET {path}")
               with urllib.request.urlopen(base + path, timeout=60) as resp:
                   return json.load(resp)
 
@@ -59,15 +60,21 @@ jobs:
           assert channels["metas"]
 
           candidate_ids = [meta["id"].split(":")[-1] for meta in channels["metas"][:20]]
+          print(f"Smoke candidate ids: {candidate_ids}")
           matched = None
+          tried = []
           for channel_id in candidate_ids:
+              tried.append(channel_id)
               meta = get_json(f"/meta/tv/dlhd:ch:{channel_id}.json")
               assert meta["meta"]["videos"]
               stream = get_json(f"/stream/tv/dlhd:ch:{channel_id}.json")
               if stream["streams"]:
                   matched = (channel_id, stream)
+                  print(f"Selected smoke channel id: {channel_id}")
                   break
 
+          if matched is None:
+              print(f"No playable local smoke channel found. Tried: {tried}")
           assert matched is not None, "no playable channel found in local smoke set"
           assert "/proxy/stream.m3u8" in matched[1]["streams"][0]["url"]
           PY
@@ -104,28 +111,39 @@ jobs:
           base = os.environ["ADDON_BASE_URL"].rstrip("/")
           configured_ids = [item.strip() for item in os.environ.get("SMOKE_CHANNEL_IDS", "").split(",") if item.strip()]
 
-          def get_json(url: str) -> dict:
-              with urllib.request.urlopen(url, timeout=90) as resp:
-                  return json.load(resp)
+          def get_json(url: str, label: str) -> dict:
+              print(f"GET {label}: {url}")
+              try:
+                  with urllib.request.urlopen(url, timeout=90) as resp:
+                      return json.load(resp)
+              except Exception as exc:
+                  print(f"Failed endpoint {label}: {url}")
+                  raise AssertionError(f"deployed smoke failed at {label}: {url}") from exc
 
-          health = get_json(base + "/healthz")
+          health = get_json(base + "/healthz", "/healthz")
           assert health["ok"] is True
 
-          manifest = get_json(base + "/manifest.json")
+          manifest = get_json(base + "/manifest.json", "/manifest.json")
           assert manifest["catalogs"]
 
-          channels = get_json(base + "/catalog/tv/channels_br.json")
+          channels = get_json(base + "/catalog/tv/channels_br.json", "/catalog/tv/channels_br.json")
           assert channels["metas"]
 
           candidate_ids = configured_ids or [meta["id"].split(":")[-1] for meta in channels["metas"][:20]]
+          print(f"Smoke candidate ids: {candidate_ids}")
           matched = None
+          tried = []
           for channel_id in candidate_ids:
-              meta = get_json(base + f"/meta/tv/dlhd:ch:{channel_id}.json")
+              tried.append(channel_id)
+              meta = get_json(base + f"/meta/tv/dlhd:ch:{channel_id}.json", f"/meta/tv/dlhd:ch:{channel_id}.json")
               assert meta["meta"]["videos"]
-              stream = get_json(base + f"/stream/tv/dlhd:ch:{channel_id}.json")
+              stream = get_json(base + f"/stream/tv/dlhd:ch:{channel_id}.json", f"/stream/tv/dlhd:ch:{channel_id}.json")
               if stream["streams"]:
                   matched = (channel_id, stream)
+                  print(f"Selected smoke channel id: {channel_id}")
                   break
 
+          if matched is None:
+              print(f"No playable deployed smoke channel found. Tried: {tried}")
           assert matched is not None, "no playable deployed channel found in smoke set"
           PY

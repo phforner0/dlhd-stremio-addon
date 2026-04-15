@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -59,3 +60,16 @@ def test_ttl_cache_remember_stale_returns_stale_and_refreshes_in_background() ->
     assert value == "old"
     assert refresh_done.wait(timeout=2) is True
     assert cache.get("alpha") == "new"
+
+
+def test_ttl_cache_logs_set_and_hit(caplog) -> None:
+    cache: TTLCache[str] = TTLCache(name="demo")
+
+    caplog.set_level(logging.DEBUG, logger="dlhd.cache")
+
+    cache.set("alpha", "value", 60)
+    assert cache.get("alpha") == "value"
+
+    assert "cache_set" in caplog.text
+    assert "cache_hit" in caplog.text
+    assert "demo" in caplog.text

@@ -8,9 +8,11 @@ from time import perf_counter
 from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
+import requests
 
 from app import settings
 from app.http import build_session
+from app.logging_utils import log_event, proxy_url_fields
 from app.models import CatalogChannel, LiveEvent, ScheduleChannelLink
 from app.normalize.country import classify_channel_country, classify_event_countries
 
@@ -103,10 +105,23 @@ def _build_event_id(day_label: str, category: str, time_text: str, title: str, c
 
 def scrape_schedule(channel_index: dict[int, CatalogChannel] | None = None) -> list[LiveEvent]:
     started_at = perf_counter()
-    with build_session() as session:
-        response = session.get(settings.BASE_SITE_URL, timeout=settings.HTTP_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        response.encoding = response.encoding or "utf-8"
+    log_event(LOGGER, logging.INFO, "scrape_schedule_start", **proxy_url_fields(settings.BASE_SITE_URL))
+    try:
+        with build_session() as session:
+            response = session.get(settings.BASE_SITE_URL, timeout=settings.HTTP_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            response.encoding = response.encoding or "utf-8"
+    except requests.RequestException as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "scrape_schedule_fail",
+            status_code=status_code,
+            duration_ms=round((perf_counter() - started_at) * 1000),
+            **proxy_url_fields(settings.BASE_SITE_URL),
+        )
+        raise
 
     soup = BeautifulSoup(response.text, "html.parser")
     events: list[LiveEvent] = []
@@ -173,7 +188,14 @@ def scrape_schedule(channel_index: dict[int, CatalogChannel] | None = None) -> l
                     )
                 )
 
-    LOGGER.debug("scrape schedule duration_ms=%s events=%s", round((perf_counter() - started_at) * 1000), len(events))
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "scrape_schedule_end",
+        event_count=len(events),
+        duration_ms=round((perf_counter() - started_at) * 1000),
+        **proxy_url_fields(settings.BASE_SITE_URL),
+    )
     return events
 
 
@@ -186,6 +208,15 @@ def filter_schedule(
     stale_after_minutes: int,
 ) -> list[LiveEvent]:
     items = [event for event in events if _should_include_event(event.scheduled_at_utc, stale_after_minutes)]
+    filtered_count = len(events) - len(items)
+    if filtered_count:
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "schedule_event_filtered_stale",
+            count=filtered_count,
+            stale_after_minutes=stale_after_minutes,
+        )
     if country_code:
         items = [event for event in items if country_code in event.country_codes]
 
