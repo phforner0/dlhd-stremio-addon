@@ -770,6 +770,71 @@ def _country_label(country_code: str) -> str:
     return settings.COUNTRY_LABELS[country_code]
 
 
+def _preview_list(items: list[str], *, limit: int) -> str:
+    visible = [item for item in items if item][:limit]
+    if not visible:
+        return ""
+    remaining = len([item for item in items if item]) - len(visible)
+    if remaining > 0:
+        return ", ".join(visible) + f", +{remaining} more"
+    return ", ".join(visible)
+
+
+def _channel_description(channel: CatalogChannel, wrapper: WrapperCatalog | None = None) -> str:
+    parts = [f"{channel.country_label} live TV channel", f"Channel {channel.channel_id}"]
+
+    page_description = wrapper.page.description if wrapper is not None else None
+    if page_description:
+        parts.append(page_description)
+
+    related_names = [
+        related.name or related.title
+        for related in (wrapper.related.channels if wrapper is not None else [])
+        if related.name or related.title
+    ]
+    related_preview = _preview_list(related_names, limit=3)
+    if related_preview:
+        parts.append(f"Quick switch: {related_preview}")
+
+    return " | ".join(parts)
+
+
+def _event_country_labels(event: LiveEvent) -> list[str]:
+    return [_country_label(code) for code in event.country_codes]
+
+
+def _event_channel_names(event: LiveEvent) -> list[str]:
+    return [channel.name for channel in event.channels if channel.name]
+
+
+def _event_description(event: LiveEvent, config: dict[str, str], *, detailed: bool) -> str:
+    day_label, time_text = _event_display_values(event, config)
+    channel_preview = _preview_list(_event_channel_names(event), limit=5 if detailed else 3)
+    country_preview = _preview_list(_event_country_labels(event), limit=3)
+
+    parts = [f"{day_label} at {time_text}", event.category]
+    if country_preview:
+        parts.append(country_preview)
+    if channel_preview:
+        parts.append(f"Channels: {channel_preview}")
+    return " | ".join(parts)
+
+
+def _channel_poster_subtitle(channel: CatalogChannel, wrapper: WrapperCatalog | None = None) -> str:
+    if wrapper is not None and wrapper.page.description:
+        return f"{channel.country_label} | Channel {channel.channel_id} | {wrapper.page.description}"
+    return f"{channel.country_label} | Channel {channel.channel_id}"
+
+
+def _event_poster_subtitle(event: LiveEvent, config: dict[str, str] | None = None) -> str:
+    day_label, time_text = _event_display_values(event, config or {})
+    channel_preview = _preview_list(_event_channel_names(event), limit=2)
+    parts = [day_label, time_text, event.category]
+    if channel_preview:
+        parts.append(channel_preview)
+    return " | ".join(parts)
+
+
 def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
     targets: list[tuple[str, str]] = []
     seen_urls: set[str] = set()
@@ -824,23 +889,27 @@ def _channel_preview(channel: CatalogChannel, request: Request) -> dict:
         "type": "tv",
         "name": channel.name,
         "poster": _poster_url(request, channel.meta_id),
+        "background": _poster_url(request, channel.meta_id),
         "posterShape": "poster",
-        "description": f"{channel.country_label} channel â€¢ ID {channel.channel_id}",
+        "description": _channel_description(channel),
         "genres": [channel.country_label],
+        "releaseInfo": channel.country_label,
     }
 
 
 def _event_preview(event: LiveEvent, request: Request, config: dict[str, str]) -> dict:
-    country_labels = [_country_label(code) for code in event.country_codes]
+    country_labels = _event_country_labels(event)
     day_label, time_text = _event_display_values(event, config)
     return {
         "id": event.meta_id,
         "type": "tv",
         "name": event.title,
         "poster": _poster_url(request, event.meta_id),
+        "background": _poster_url(request, event.meta_id),
         "posterShape": "poster",
-        "description": f"{day_label} â€¢ {time_text} â€¢ {event.category}",
+        "description": _event_description(event, config, detailed=False),
         "genres": [event.category, *country_labels],
+        "releaseInfo": f"{day_label} {time_text}",
     }
 
 
@@ -1123,8 +1192,8 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
                         request=request,
                         display_name=settings.ADDON_NAME,
                         description=(
-                            f"{channel.name} â€¢ {channel.country_label} â€¢ "
-                            f"{resolution.label} â€¢ {manifest.player_type.upper()}"
+                            f"{channel.name} | {channel.country_label} | "
+                            f"{resolution.label} | {manifest.player_type.upper()}"
                         ),
                         manifest_url=manifest.url,
                         referer=manifest.found_at_url,
@@ -1239,7 +1308,7 @@ def _resolve_live_channel_stream(event: LiveEvent, linked_channel, request: Requ
     return _manifest_to_stream(
         request=request,
         display_name=settings.ADDON_NAME,
-        description=f"{linked_channel.name} â€¢ {linked_channel.country_label} â€¢ {event.title} â€¢ {payload['player_type']}",
+        description=f"{linked_channel.name} | {linked_channel.country_label} | {event.title} | {payload['player_type']}",
         manifest_url=payload["url"],
         referer=payload["referer"],
         player_type=payload["player_type"],
@@ -1428,10 +1497,10 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
             except HTTPException:
                 log_event(LOGGER, logging.WARNING, "meta_not_found", **request_fields, kind=kind, channel_id=channel_id)
                 raise
-            channel = CatalogChannel(
-                channel_id=channel_id,
-                name=wrapper.channel.name or wrapper.page.title or f"Channel {channel_id}",
-                watch_url=f"{settings.BASE_SITE_URL}/watch.php?id={channel_id}",
+                channel = CatalogChannel(
+                    channel_id=channel_id,
+                    name=wrapper.channel.name or wrapper.page.title or f"Channel {channel_id}",
+                    watch_url=f"{settings.BASE_SITE_URL}/watch.php?id={channel_id}",
                 search_hint=None,
                 group_letter=None,
                 country_code="global",
@@ -1445,12 +1514,9 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
             "poster": _poster_url(request, channel.meta_id),
             "posterShape": "poster",
             "background": _poster_url(request, channel.meta_id),
-            "description": (
-                wrapper.page.description
-                if wrapper is not None and wrapper.page.description
-                else f"{channel.country_label} channel â€¢ ID {channel.channel_id}"
-            ),
+            "description": _channel_description(channel, wrapper),
             "genres": [channel.country_label],
+            "releaseInfo": channel.country_label,
             "videos": [_default_video(channel.meta_id, channel.name)],
             "behaviorHints": {"defaultVideoId": channel.meta_id},
         }
@@ -1470,11 +1536,9 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
         "poster": _poster_url(request, event.meta_id),
         "posterShape": "poster",
         "background": _poster_url(request, event.meta_id),
-        "description": (
-            f"{event_day_label} â€¢ {event_time_text} â€¢ {event.category}\n"
-            f"Channels: {', '.join(channel.name for channel in event.channels)}"
-        ),
-        "genres": [event.category, *[_country_label(code) for code in event.country_codes]],
+        "description": _event_description(event, user_config, detailed=True),
+        "genres": [event.category, *_event_country_labels(event)],
+        "releaseInfo": f"{event_day_label} {event_time_text}",
         "videos": [_default_video(event.meta_id, event.title)],
         "behaviorHints": {"defaultVideoId": event.meta_id},
     }
@@ -1733,11 +1797,20 @@ def poster(meta_id: str) -> Response:
         if channel is None:
             wrapper = _wrapper_or_http_error(value)
             title = wrapper.channel.name or wrapper.page.title or f"Channel {value}"
-            subtitle = settings.COUNTRY_LABELS["global"]
+            fallback_channel = CatalogChannel(
+                channel_id=value,
+                name=title,
+                watch_url=f"{settings.BASE_SITE_URL}/watch.php?id={value}",
+                search_hint=None,
+                group_letter=None,
+                country_code="global",
+                country_label=settings.COUNTRY_LABELS["global"],
+            )
+            subtitle = _channel_poster_subtitle(fallback_channel, wrapper)
             accent = "global"
         else:
             title = channel.name
-            subtitle = channel.country_label
+            subtitle = _channel_poster_subtitle(channel)
             accent = channel.country_code
         svg = render_svg_poster(title, subtitle, accent)
         return Response(content=svg, media_type="image/svg+xml")
@@ -1748,7 +1821,7 @@ def poster(meta_id: str) -> Response:
         return Response(content=svg, media_type="image/svg+xml")
 
     accent = event.country_codes[0] if event.country_codes else "global"
-    subtitle = f"{event.time_text} â€¢ {event.category}"
+    subtitle = _event_poster_subtitle(event)
     svg = render_svg_poster(event.title, subtitle, accent)
     return Response(content=svg, media_type="image/svg+xml")
 
