@@ -225,7 +225,9 @@ https://your-domain.example.com/manifest.json
 The service exposes a few environment variables for tuning live stream resolution:
 
 - `DLHD_PROXY_ALLOWED_HOSTS`
-  Host allowlist for `/proxy` upstream and redirect targets.
+  Optional additive host allowlist for `/proxy` upstream and redirect targets. Built-in provider hosts stay enabled unless strict mode is turned on.
+- `DLHD_PROXY_ALLOWED_HOSTS_STRICT`
+  Makes `DLHD_PROXY_ALLOWED_HOSTS` replace the built-in provider allowlist instead of extending it. Default: `0`
 - `DLHD_PROXY_MAX_REDIRECTS`
   Caps upstream redirect hops for `/proxy`. Default: `5`
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`
@@ -290,7 +292,8 @@ You can override these in `.env` or your deployment platform:
 
 - `PORT`: service listen port inside the container. Default: `7000`
 - `DLHD_BASE_URL`: upstream site base URL. Default: `https://dlstreams.top`
-- `DLHD_PROXY_ALLOWED_HOSTS`: allowlist for `/proxy` targets and redirects.
+- `DLHD_PROXY_ALLOWED_HOSTS`: optional additive allowlist for `/proxy` targets and redirects.
+- `DLHD_PROXY_ALLOWED_HOSTS_STRICT`: replace the built-in provider allowlist instead of extending it. Default: `0`
 - `DLHD_PROXY_MAX_REDIRECTS`: max upstream redirects followed by `/proxy`. Default: `5`
 - `DLHD_HTTP_POOL_CONNECTIONS`: pooled upstream HTTP connection count. Default: `32`
 - `DLHD_HTTP_POOL_MAXSIZE`: pooled upstream HTTP max size. Default: `64`

@@ -171,7 +171,8 @@ jobs:
           channels = get_json(base + "/catalog/tv/channels_br.json", "/catalog/tv/channels_br.json")
           assert channels["metas"]
 
-          candidate_ids = configured_ids or [meta["id"].split(":")[-1] for meta in channels["metas"][:20]]
+          catalog_candidate_ids = [meta["id"].split(":")[-1] for meta in channels["metas"][:20]]
+          candidate_ids = configured_ids + [channel_id for channel_id in catalog_candidate_ids if channel_id not in configured_ids]
           print(f"Smoke candidate ids: {candidate_ids}")
           matched = None
           tried = []

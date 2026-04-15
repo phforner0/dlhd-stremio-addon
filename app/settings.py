@@ -11,6 +11,26 @@ def _env_flag(name: str, default: bool) -> bool:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
+
+def _csv_hosts(raw_value: str | None) -> tuple[str, ...]:
+    if not raw_value:
+        return ()
+    return tuple(host.strip().lower() for host in raw_value.split(",") if host.strip())
+
+
+def _build_proxy_allowed_hosts(raw_value: str | None, *, strict: bool) -> tuple[str, ...]:
+    defaults = default_proxy_allowed_hosts()
+    configured = _csv_hosts(raw_value)
+    if strict and configured:
+        return configured
+    if not configured:
+        return defaults
+    merged: list[str] = []
+    for host in (*defaults, *configured):
+        if host not in merged:
+            merged.append(host)
+    return tuple(merged)
+
 BASE_SITE_URL = os.getenv("DLHD_BASE_URL", "https://dlstreams.top").rstrip("/")
 ADDON_ID = os.getenv("DLHD_ADDON_ID", "com.dlhd.stremio")
 ADDON_NAME = os.getenv("DLHD_ADDON_NAME", "DLHD Streams")
@@ -28,14 +48,8 @@ RESOURCE_LOG_INTERVAL_SECONDS = int(os.getenv("DLHD_RESOURCE_LOG_INTERVAL_SECOND
 
 HTTP_TIMEOUT_SECONDS = int(os.getenv("DLHD_HTTP_TIMEOUT", "20"))
 PROXY_MAX_REDIRECTS = int(os.getenv("DLHD_PROXY_MAX_REDIRECTS", "5"))
-PROXY_ALLOWED_HOSTS = tuple(
-    host.strip().lower()
-    for host in os.getenv(
-        "DLHD_PROXY_ALLOWED_HOSTS",
-        ",".join(default_proxy_allowed_hosts()),
-    ).split(",")
-    if host.strip()
-)
+PROXY_ALLOWED_HOSTS_STRICT = _env_flag("DLHD_PROXY_ALLOWED_HOSTS_STRICT", False)
+PROXY_ALLOWED_HOSTS = _build_proxy_allowed_hosts(os.getenv("DLHD_PROXY_ALLOWED_HOSTS"), strict=PROXY_ALLOWED_HOSTS_STRICT)
 PLAYWRIGHT_WAIT_SECONDS = int(os.getenv("DLHD_PLAYWRIGHT_WAIT", "6"))
 PLAYWRIGHT_TIMEOUT_MS = int(os.getenv("DLHD_PLAYWRIGHT_TIMEOUT_MS", "20000"))
 PLAYWRIGHT_MAX_CONCURRENCY = int(os.getenv("DLHD_PLAYWRIGHT_MAX_CONCURRENCY", "4"))
