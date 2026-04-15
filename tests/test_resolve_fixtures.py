@@ -4,7 +4,7 @@ from pathlib import Path
 
 from app.main import _extract_hls_probe_targets, _looks_like_hls_playlist
 from app.resolve.player import _extract_embed_proxy_manifest, _extract_embed_proxy_manifest_from_url
-from app.resolve.providers import should_attempt_bootstrap_fetch
+from app.resolve.providers import bootstrap_parse_results, matching_bootstrap_strategy_names, should_attempt_bootstrap_fetch
 from app.scrape.watch import parse_wrapper
 
 
@@ -84,6 +84,55 @@ def test_extract_embed_proxy_manifest_from_url_uses_fixture_html(monkeypatch) ->
     )
 
     manifests = _extract_embed_proxy_manifest_from_url(iframe_url, "https://dlstreams.top/watch/stream-81.php")
+
+    assert manifests == ["https://chevy.soyspace.cyou/proxy/x4/espnbrazil/mono.css"]
+
+
+def test_bootstrap_inputs_prefer_specific_strategy_before_fallback() -> None:
+    results = bootstrap_parse_results(
+        _fixture_text("embed_viewembed_espnbrazil.html"),
+        source_url="https://viewembed.ru/channel/ESPNBrazil[Brazil]",
+    )
+
+    assert results[0].strategy_name == "topembed-channel"
+    assert results[0].reason == "parsed"
+    assert results[0].inputs is not None
+
+
+def test_bootstrap_parse_exposes_reason_when_markers_are_missing() -> None:
+    results = bootstrap_parse_results(
+        "<html><body>no bootstrap markers here</body></html>",
+        source_url="https://viewembed.ru/channel/ESPNBrazil[Brazil]",
+    )
+
+    assert results[0].strategy_name == "topembed-channel"
+    assert results[0].reason == "missing_markers"
+    assert results[0].inputs is None
+
+
+def test_bootstrap_context_reprioritizes_strategy_for_player_type() -> None:
+    iframe_url = "https://viewembed.ru/embed/ESPNBrazil"
+
+    assert matching_bootstrap_strategy_names(iframe_url) == ("known-host-fallback", "topembed-channel")
+    assert matching_bootstrap_strategy_names(iframe_url, player_url="https://dlstreams.top/watch/stream-81.php") == (
+        "topembed-channel",
+        "known-host-fallback",
+    )
+
+
+def test_bootstrap_from_url_uses_player_context_for_known_host_path_drift(monkeypatch) -> None:
+    iframe_url = "https://viewembed.ru/embed/ESPNBrazil"
+    monkeypatch.setattr(
+        "app.resolve.player.build_session",
+        lambda: _FakeSession({iframe_url: _fixture_text("embed_viewembed_espnbrazil.html")}),
+    )
+
+    manifests = _extract_embed_proxy_manifest_from_url(
+        iframe_url,
+        "https://dlstreams.top/watch/stream-81.php",
+        player_url="https://dlstreams.top/watch/stream-81.php",
+        player_label="Player 3",
+    )
 
     assert manifests == ["https://chevy.soyspace.cyou/proxy/x4/espnbrazil/mono.css"]
 

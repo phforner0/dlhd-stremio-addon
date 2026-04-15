@@ -62,3 +62,13 @@ def test_stream_unknown_channel_maps_watch_error_to_not_found(monkeypatch) -> No
     response = client.get("/stream/tv/dlhd:ch:999999.json")
 
     assert response.status_code == 404
+
+
+def test_invalid_config_token_falls_back_to_default_manifest() -> None:
+    client = TestClient(app)
+
+    response = client.get("/cfg-not-a-real-token/manifest.json")
+
+    assert response.status_code == 200
+    assert response.json()["version"] == "0.1.3"
+    assert response.json()["behaviorHints"]["configurable"] is True

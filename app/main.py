@@ -37,6 +37,7 @@ from app.resolve.player import PlaywrightResolver
 from app.scrape.channels import filter_channels, scrape_channels
 from app.scrape.schedule import _display_schedule_values, filter_schedule, scrape_schedule
 from app.scrape.watch import WatchFetchError, fetch_wrapper
+from app.upstream_health import UPSTREAM_HEALTH, UpstreamCircuitOpen, guarded_get
 from app.user_config import (
     catalog_mode as user_catalog_mode,
     channel_stream_result_limit as user_channel_stream_result_limit,
@@ -54,6 +55,7 @@ configure_logging()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    UPSTREAM_HEALTH.reset()
     _log_app_start()
     _log_resource_snapshot("startup")
     _start_resource_logger()
@@ -64,6 +66,7 @@ async def lifespan(_app: FastAPI):
         _log_app_shutdown()
         resolver.close()
         close_pooled_sessions()
+        UPSTREAM_HEALTH.reset()
         _log_resource_snapshot("shutdown")
 
 
@@ -180,6 +183,7 @@ def _resource_snapshot_fields() -> dict[str, object]:
         "rss_mb": current_rss_mb(),
         "active_browsers": resolver.active_browser_count(),
         "pooled_http_sessions": pooled_session_count(),
+        "degraded_upstream_hosts": UPSTREAM_HEALTH.degraded_host_count(),
         **_cache_counts(),
     }
 
@@ -248,6 +252,9 @@ def _log_app_start() -> None:
         live_channel_cache_max_entries=settings.LIVE_CHANNEL_CACHE_MAX_ENTRIES,
         playlist_cache_max_entries=settings.HLS_PLAYLIST_CACHE_MAX_ENTRIES,
         hls_validation_cache_max_entries=settings.HLS_VALIDATION_MAX_ENTRIES,
+        upstream_failure_threshold=settings.UPSTREAM_FAILURE_THRESHOLD,
+        upstream_failure_window_seconds=settings.UPSTREAM_FAILURE_WINDOW_SECONDS,
+        upstream_cooldown_seconds=settings.UPSTREAM_COOLDOWN_SECONDS,
     )
 
 
@@ -414,7 +421,7 @@ def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> tuple[bool, 
     try:
         headers = {"Referer": referer}
         log_event(LOGGER, logging.DEBUG, "hls_validation_start", depth=depth, **proxy_url_fields(url))
-        response = _follow_proxy_redirects(session, url, headers)
+        response = _follow_proxy_redirects(session, url, headers, health_operation="hls_validation")
         response.raise_for_status()
         content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
 
@@ -434,9 +441,12 @@ def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> tuple[bool, 
             key_url, media_url = _extract_hls_probe_targets(body, response.url)
             if key_url is not None:
                 try:
-                    key_response = _follow_proxy_redirects(session, key_url, headers)
+                    key_response = _follow_proxy_redirects(session, key_url, headers, health_operation="hls_validation")
                     key_response.raise_for_status()
                     key_response.close()
+                except UpstreamCircuitOpen:
+                    log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="upstream_circuit_open", depth=depth, **proxy_url_fields(key_url))
+                    return False, "upstream_circuit_open"
                 except HTTPException:
                     log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="media_redirect_blocked", depth=depth, **proxy_url_fields(key_url))
                     return False, "media_redirect_blocked"
@@ -451,6 +461,9 @@ def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> tuple[bool, 
         response.close()
         log_event(LOGGER, logging.DEBUG, "hls_validation_pass", depth=depth, **proxy_url_fields(url))
         return True, None
+    except UpstreamCircuitOpen:
+        log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="upstream_circuit_open", depth=depth, **proxy_url_fields(url))
+        return False, "upstream_circuit_open"
     except HTTPException:
         log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="media_redirect_blocked", depth=depth, **proxy_url_fields(url))
         return False, "media_redirect_blocked"
@@ -893,12 +906,21 @@ def _proxy_media_url(
     return f"{_service_base_url(request)}/proxy/{safe_filename}?{query}"
 
 
-def _follow_proxy_redirects(session, url: str, headers: dict[str, str], *, log_fields: dict[str, object] | None = None):
+def _follow_proxy_redirects(
+    session,
+    url: str,
+    headers: dict[str, str],
+    *,
+    log_fields: dict[str, object] | None = None,
+    health_operation: str = "proxy_upstream",
+):
     current_url = _validate_proxy_url(url, "url")
     response = None
     for _ in range(settings.PROXY_MAX_REDIRECTS + 1):
-        response = session.get(
+        response = guarded_get(
+            session,
             current_url,
+            operation=health_operation,
             timeout=settings.HTTP_TIMEOUT_SECONDS,
             stream=True,
             allow_redirects=False,
@@ -1594,6 +1616,16 @@ def proxy_media(
     try:
         upstream = _follow_proxy_redirects(session, validated_url, headers, log_fields=request_fields)
         upstream.raise_for_status()
+    except UpstreamCircuitOpen as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "proxy_upstream_skipped",
+            **request_fields,
+            reason="circuit_open",
+            upstream_host=exc.host,
+        )
+        raise HTTPException(status_code=503, detail="upstream temporarily unavailable") from exc
     except requests.RequestException as exc:
         status_code = exc.response.status_code if exc.response is not None else None
         log_event(

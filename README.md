@@ -320,6 +320,10 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_LIVE_CHANNEL_CACHE_TTL`: per-channel live resolution cache TTL. Default: `120`
 - `DLHD_HLS_PLAYLIST_CACHE_TTL`: rewritten HLS playlist cache TTL. Default: `15`
 - `DLHD_FAILED_STREAM_CACHE_TTL`: currently used for local tuning only. Default: `30`
+- `DLHD_UPSTREAM_FAILURE_THRESHOLD`: failures per host before opening a short cooldown. Default: `3`
+- `DLHD_UPSTREAM_FAILURE_WINDOW_SECONDS`: rolling failure window for the breaker. Default: `90`
+- `DLHD_UPSTREAM_COOLDOWN_SECONDS`: cooldown length once a host trips. Default: `180`
+- `DLHD_UPSTREAM_HEALTH_MAX_HOSTS`: max hosts tracked by the breaker. Default: `256`
 - `DLHD_LOG_LEVEL`: application log level. Default: `INFO`
 - `DLHD_LOG_FORMAT`: `text` or `json`. Default: `text`
 - `DLHD_LOG_REQUEST_START`: emit `request_start` for every request. Default: `0`
@@ -351,5 +355,7 @@ High-value events to watch:
   HLS validation details for “no streams available” reports. Failure reasons include `not_extm3u`, `key_fetch_failed`, `media_missing`, `media_redirect_blocked`, `media_http_403`, `media_http_404`, and `media_html_instead_of_binary`.
 - `cache_hit`, `cache_miss`, `cache_stale_hit`, `cache_refresh_start`, `cache_refresh_end`, `cache_refresh_fail`
   Cache behavior by cache name and key class.
+- `upstream_circuit_opened`, `upstream_request_skipped`, `upstream_recovered`
+  Per-host circuit breaker state for flaky upstreams. Helps distinguish a dead host from a single bad stream.
 - `app_start`, `app_shutdown`, `resource_snapshot`
   Startup knobs and memory/browser/session snapshots for operational debugging.

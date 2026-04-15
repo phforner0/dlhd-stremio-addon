@@ -93,7 +93,7 @@ def test_hls_validation_logs_failure_reason(monkeypatch, caplog) -> None:
     monkeypatch.setattr("app.main.build_session", lambda: _FakeSession())
     monkeypatch.setattr(
         "app.main._follow_proxy_redirects",
-        lambda session, url, headers, log_fields=None: _FakeResponse(url, "application/vnd.apple.mpegurl", "not a playlist"),
+        lambda session, url, headers, log_fields=None, health_operation="hls_validation": _FakeResponse(url, "application/vnd.apple.mpegurl", "not a playlist"),
     )
 
     caplog.set_level(logging.DEBUG, logger="dlhd.addon")

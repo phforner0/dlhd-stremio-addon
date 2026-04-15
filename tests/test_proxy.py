@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app.main import _host_allowed, app, playlist_cache
+from app.upstream_health import UpstreamCircuitOpen
 
 
 class FakeResponse:
@@ -176,3 +177,16 @@ def test_proxy_passes_range_header(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert session.calls[0][1]["Range"] == "bytes=0-3"
+
+
+def test_proxy_returns_503_when_upstream_circuit_is_open(monkeypatch) -> None:
+    client = TestClient(app)
+    monkeypatch.setattr("app.main.guarded_get", lambda *args, **kwargs: (_ for _ in ()).throw(UpstreamCircuitOpen("vid.aivideox.site", "proxy_upstream")))
+    monkeypatch.setattr("app.main._public_host", lambda host: True)
+
+    response = client.get(
+        "/proxy/media.ts",
+        params={"url": "https://vid.aivideox.site/media.ts", "referer": "https://embedkclx.sbs/premiumtv/daddyhd.php?id=81"},
+    )
+
+    assert response.status_code == 503

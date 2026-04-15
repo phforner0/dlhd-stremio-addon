@@ -15,7 +15,8 @@ from app import settings
 from app.http import DEFAULT_HEADERS, build_session
 from app.logging_utils import log_event, proxy_url_fields
 from app.models import ManifestResult, PlayerResolution, WrapperCatalog
-from app.resolve.providers import should_attempt_bootstrap_fetch
+from app.resolve.providers import BootstrapInputs, bootstrap_parse_results, should_attempt_bootstrap_fetch
+from app.upstream_health import guarded_get
 
 LOGGER = logging.getLogger("dlhd.resolve")
 
@@ -80,8 +81,6 @@ STREAM_JSON_KEYS: tuple[str, ...] = (
     "stream",
 )
 
-EMBED_CHANNEL_KEY_RE = re.compile(r"const\s+CHANNEL_KEY\s*=\s*['\"]([^'\"]+)['\"]")
-EMBED_SERVERS_RE = re.compile(r"let\s+M3U8_SERVERS\s*=\s*\[(.*?)\]", re.S)
 EMBED_PROXY_RE = re.compile(
     r"https?://[^/]+/proxy/(?:top1/cdn|[^/]+)/[^/]+/mono\.css(?:[?#][^\s'\"<>]*)?",
     re.I,
@@ -143,67 +142,146 @@ def _is_playlist(url: str) -> bool:
 
 
 def _extract_embed_proxy_manifest(html: str, timeout: int = 10) -> list[str]:
-    if "CHANNEL_KEY" not in html or "M3U8_SERVERS" not in html or "server_lookup" not in html:
-        return []
+    return _extract_embed_proxy_manifest_with_source(html, timeout=timeout, source_url=None)
 
-    channel_match = EMBED_CHANNEL_KEY_RE.search(html)
-    servers_match = EMBED_SERVERS_RE.search(html)
-    if not channel_match or not servers_match:
-        return []
 
-    channel_key = _clean(channel_match.group(1))
-    servers = [
-        server.strip()
-        for server in re.findall(r"['\"]([^'\"]+)['\"]", servers_match.group(1))
-        if server.strip()
-    ]
-    if not channel_key or not servers:
-        return []
+def _proxy_manifest_from_parts(server: str, server_key: str, channel_key: str) -> str:
+    return (
+        f"https://{server}/proxy/top1/cdn/{channel_key}/mono.css"
+        if server_key == "top1/cdn"
+        else f"https://{server}/proxy/{server_key}/{channel_key}/mono.css"
+    )
+
+
+def _resolve_bootstrap_inputs(inputs: BootstrapInputs, *, timeout: int = 10) -> tuple[list[str], str | None, int]:
+    last_reason = "status_probe_failed"
 
     try:
         with build_session() as session:
             session.headers.update({"Accept": "application/json, text/plain, */*"})
-            selected_server = servers[0]
-            for server in servers:
+            selected_server = inputs.servers[0]
+            for server in inputs.servers:
                 try:
-                    response = session.get(f"https://{server}/status", timeout=timeout)
+                    response = guarded_get(session, f"https://{server}/status", operation="resolver_bootstrap", timeout=timeout)
                     response.raise_for_status()
                     payload = response.json()
                     if isinstance(payload, dict) and payload.get("success") is True:
                         selected_server = server
+                        last_reason = None
                         break
+                    last_reason = "status_not_ready"
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.debug("Status probe failed for %s: %s", server, exc)
+                    last_reason = "upstream_circuit_open" if exc.__class__.__name__ == "UpstreamCircuitOpen" else "status_probe_failed"
+                    if last_reason == "upstream_circuit_open":
+                        return [], last_reason, 1
 
-            response = session.get(
-                f"https://{selected_server}/server_lookup",
-                params={"channel_id": channel_key},
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            server_key = _clean(payload.get("server_key")) if isinstance(payload, dict) else None
-            if not server_key:
-                return []
+            for attempt in range(1, 3):
+                try:
+                    response = guarded_get(
+                        session,
+                        f"https://{selected_server}/server_lookup",
+                        operation="resolver_bootstrap",
+                        params={"channel_id": inputs.channel_key},
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.debug("Bootstrap lookup failed for %s attempt=%s: %s", inputs.strategy_name, attempt, exc)
+                    last_reason = "upstream_circuit_open" if exc.__class__.__name__ == "UpstreamCircuitOpen" else "lookup_failed"
+                    if last_reason == "upstream_circuit_open":
+                        return [], last_reason, attempt
+                    continue
 
-            proxy_manifest = (
-                f"https://{selected_server}/proxy/top1/cdn/{channel_key}/mono.css"
-                if server_key == "top1/cdn"
-                else f"https://{selected_server}/proxy/{server_key}/{channel_key}/mono.css"
-            )
+                server_key = _clean(payload.get("server_key")) if isinstance(payload, dict) else None
+                if not server_key:
+                    last_reason = "server_key_missing"
+                    continue
 
-            probe = session.get(proxy_manifest, timeout=timeout)
-            probe.raise_for_status()
-            if not probe.text.lstrip().startswith("#EXTM3U"):
-                return []
+                proxy_manifest = _proxy_manifest_from_parts(selected_server, server_key, inputs.channel_key)
+                try:
+                    probe = guarded_get(session, proxy_manifest, operation="resolver_bootstrap", timeout=timeout)
+                    probe.raise_for_status()
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.debug("Bootstrap manifest probe failed for %s attempt=%s: %s", inputs.strategy_name, attempt, exc)
+                    last_reason = "upstream_circuit_open" if exc.__class__.__name__ == "UpstreamCircuitOpen" else "manifest_probe_failed"
+                    if last_reason == "upstream_circuit_open":
+                        return [], last_reason, attempt
+                    continue
 
-            return [proxy_manifest]
+                if not probe.text.lstrip().startswith("#EXTM3U"):
+                    last_reason = "manifest_not_extm3u"
+                    continue
+
+                return [proxy_manifest], None, attempt
     except Exception as exc:  # noqa: BLE001
-        LOGGER.debug("Bootstrap proxy extraction failed: %s", exc)
-        return []
+        LOGGER.debug("Bootstrap proxy extraction failed for %s: %s", inputs.strategy_name, exc)
+        return [], "upstream_circuit_open" if exc.__class__.__name__ == "UpstreamCircuitOpen" else exc.__class__.__name__, 1
+
+    return [], last_reason, 2
 
 
-def _extract_embed_proxy_manifest_from_url(url: str, referer: str, timeout: int = 10) -> list[str]:
+def _extract_embed_proxy_manifest_with_source(
+    html: str,
+    *,
+    timeout: int = 10,
+    source_url: str | None,
+    player_url: str | None = None,
+    player_label: str | None = None,
+) -> list[str]:
+    parse_results = bootstrap_parse_results(html, source_url=source_url, player_url=player_url, player_label=player_label)
+    for order, parse_result in enumerate(parse_results, start=1):
+        if parse_result.inputs is None:
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "bootstrap_strategy_failed",
+                strategy=parse_result.strategy_name,
+                reason=parse_result.reason,
+                strategy_order=order,
+                strategy_priority=parse_result.priority,
+                **proxy_url_fields(source_url),
+            )
+            continue
+
+        manifests, reason, attempts = _resolve_bootstrap_inputs(parse_result.inputs, timeout=timeout)
+        if manifests:
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "bootstrap_strategy_succeeded",
+                strategy=parse_result.strategy_name,
+                strategy_order=order,
+                strategy_priority=parse_result.priority,
+                retry_count=attempts,
+                **proxy_url_fields(source_url),
+            )
+            return manifests
+
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "bootstrap_strategy_failed",
+            strategy=parse_result.strategy_name,
+            reason=reason or "bootstrap_failed",
+            strategy_order=order,
+            strategy_priority=parse_result.priority,
+            retry_count=attempts,
+            **proxy_url_fields(source_url),
+        )
+
+    return []
+
+
+def _extract_embed_proxy_manifest_from_url(
+    url: str,
+    referer: str,
+    timeout: int = 10,
+    *,
+    player_url: str | None = None,
+    player_label: str | None = None,
+) -> list[str]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return []
@@ -213,9 +291,15 @@ def _extract_embed_proxy_manifest_from_url(url: str, referer: str, timeout: int 
     try:
         with build_session() as session:
             session.headers.update({"Referer": referer})
-            response = session.get(url, timeout=timeout)
+            response = guarded_get(session, url, operation="resolver_bootstrap", timeout=timeout)
             response.raise_for_status()
-            return _extract_embed_proxy_manifest(response.text, timeout=timeout)
+            return _extract_embed_proxy_manifest_with_source(
+                response.text,
+                timeout=timeout,
+                source_url=url,
+                player_url=player_url,
+                player_label=player_label,
+            )
     except Exception as exc:  # noqa: BLE001
         LOGGER.debug("Bootstrap fetch failed for %s: %s", url, exc)
         return []
@@ -249,7 +333,7 @@ def _derive_proxy_manifest_from_lookup(response: Any, timeout: int = 10) -> str 
 
     try:
         with build_session() as session:
-            probe = session.get(proxy_manifest, timeout=timeout)
+            probe = guarded_get(session, proxy_manifest, operation="resolver_bootstrap", timeout=timeout)
             probe.raise_for_status()
             return proxy_manifest if probe.text.lstrip().startswith("#EXTM3U") else None
     except Exception as exc:  # noqa: BLE001
@@ -294,7 +378,7 @@ def _scan_html_for_manifests(html: str, base_url: str) -> list[str]:
             seen.add(url)
             found.append(url)
 
-    for url in _extract_embed_proxy_manifest(html):
+    for url in _extract_embed_proxy_manifest_with_source(html, source_url=base_url, player_url=base_url):
         if url not in seen:
             seen.add(url)
             found.append(url)
@@ -844,7 +928,7 @@ class PlaywrightResolver:
                     _append_unique_hits(
                         iframe_hits,
                         iframe_seen_manifest_set,
-                        _hits(_extract_embed_proxy_manifest_from_url(frame_url, page_url), frame_url),
+                        _hits(_extract_embed_proxy_manifest_from_url(frame_url, page_url, player_url=player_url, player_label=label), frame_url),
                     )
 
                     if _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
@@ -858,7 +942,7 @@ class PlaywrightResolver:
                         _append_unique_hits(
                             iframe_hits,
                             iframe_seen_manifest_set,
-                            _hits(_extract_embed_proxy_manifest_from_url(iframe_url, page_url), iframe_url),
+                            _hits(_extract_embed_proxy_manifest_from_url(iframe_url, page_url, player_url=player_url, player_label=label), iframe_url),
                         )
                         if _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
                             break
@@ -931,7 +1015,7 @@ class PlaywrightResolver:
                             _append_unique_hits(
                                 iframe_hits,
                                 iframe_seen_manifest_set,
-                                _hits(_extract_embed_proxy_manifest_from_url(ext_final, page_url), ext_final),
+                                _hits(_extract_embed_proxy_manifest_from_url(ext_final, page_url, player_url=player_url, player_label=label), ext_final),
                             )
 
                             if not _has_manifest_hits(iframe_hits):
@@ -945,7 +1029,7 @@ class PlaywrightResolver:
                                     _append_unique_hits(
                                         iframe_hits,
                                         iframe_seen_manifest_set,
-                                        _hits(_extract_embed_proxy_manifest_from_url(sub_url, page_url), sub_url),
+                                        _hits(_extract_embed_proxy_manifest_from_url(sub_url, page_url, player_url=player_url, player_label=label), sub_url),
                                     )
 
                                     if _has_manifest_hits(iframe_hits):

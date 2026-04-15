@@ -22,6 +22,7 @@ from app.models import (
     SourceInfo,
     WrapperCatalog,
 )
+from app.upstream_health import UpstreamCircuitOpen, guarded_get
 
 LOGGER = logging.getLogger("dlhd.scrape.watch")
 
@@ -155,7 +156,13 @@ def fetch_wrapper(channel_id: int) -> WrapperCatalog:
     log_event(LOGGER, logging.INFO, "watch_fetch_start", channel_id=channel_id, **proxy_url_fields(url))
     try:
         with build_session() as session:
-            response = session.get(url, timeout=settings.HTTP_TIMEOUT_SECONDS, allow_redirects=True)
+            response = guarded_get(
+                session,
+                url,
+                operation="watch_fetch",
+                timeout=settings.HTTP_TIMEOUT_SECONDS,
+                allow_redirects=True,
+            )
             response.raise_for_status()
             response.encoding = response.encoding or "utf-8"
             wrapper = parse_wrapper(response.text, response.url)
@@ -169,6 +176,18 @@ def fetch_wrapper(channel_id: int) -> WrapperCatalog:
                 **proxy_url_fields(response.url),
             )
             return wrapper
+    except UpstreamCircuitOpen as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "watch_fetch_fail",
+            channel_id=channel_id,
+            duration_ms=round((perf_counter() - started_at) * 1000),
+            reason="circuit_open",
+            upstream_host=exc.host,
+            **proxy_url_fields(url),
+        )
+        raise WatchFetchError(channel_id, None, f"watch fetch skipped for channel {channel_id}") from exc
     except requests.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else None
         log_event(

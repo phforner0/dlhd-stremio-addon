@@ -40,6 +40,8 @@ jobs:
         run: |
           python - <<'PY'
           import json
+          import urllib.error
+          import urllib.parse
           import urllib.request
 
           base = "http://127.0.0.1:7000"
@@ -49,12 +51,31 @@ jobs:
               with urllib.request.urlopen(base + path, timeout=60) as resp:
                   return json.load(resp)
 
+          def expect_status(path: str, status_code: int) -> None:
+              print(f"EXPECT {status_code} {path}")
+              try:
+                  urllib.request.urlopen(base + path, timeout=60)
+              except urllib.error.HTTPError as exc:
+                  assert exc.code == status_code
+                  return
+              raise AssertionError(f"expected HTTP {status_code} for {path}")
+
           health = get_json("/healthz")
           assert health["ok"] is True
 
           manifest = get_json("/manifest.json")
           assert manifest["version"] == "0.1.3"
           assert len(manifest["catalogs"]) == 28
+
+          invalid_manifest = get_json("/cfg-not-a-real-token/manifest.json")
+          assert invalid_manifest["version"] == manifest["version"]
+          assert invalid_manifest["behaviorHints"]["configurable"] is True
+
+          blocked_query = urllib.parse.urlencode({
+              "url": "https://example.com/evil.m3u8",
+              "referer": "https://embedkclx.sbs/premiumtv/daddyhd.php?id=81",
+          })
+          expect_status(f"/proxy/stream.m3u8?{blocked_query}", 403)
 
           channels = get_json("/catalog/tv/channels_br.json")
           assert channels["metas"]
@@ -106,6 +127,8 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import urllib.error
+          import urllib.parse
           import urllib.request
 
           base = os.environ["ADDON_BASE_URL"].rstrip("/")
@@ -120,11 +143,30 @@ jobs:
                   print(f"Failed endpoint {label}: {url}")
                   raise AssertionError(f"deployed smoke failed at {label}: {url}") from exc
 
+          def expect_status(url: str, label: str, status_code: int) -> None:
+              print(f"EXPECT {status_code} {label}: {url}")
+              try:
+                  urllib.request.urlopen(url, timeout=90)
+              except urllib.error.HTTPError as exc:
+                  assert exc.code == status_code
+                  return
+              raise AssertionError(f"expected HTTP {status_code} at {label}: {url}")
+
           health = get_json(base + "/healthz", "/healthz")
           assert health["ok"] is True
 
           manifest = get_json(base + "/manifest.json", "/manifest.json")
           assert manifest["catalogs"]
+
+          invalid_manifest = get_json(base + "/cfg-not-a-real-token/manifest.json", "/cfg-not-a-real-token/manifest.json")
+          assert invalid_manifest["version"] == manifest["version"]
+          assert invalid_manifest["behaviorHints"]["configurable"] is True
+
+          blocked_query = urllib.parse.urlencode({
+              "url": "https://example.com/evil.m3u8",
+              "referer": "https://embedkclx.sbs/premiumtv/daddyhd.php?id=81",
+          })
+          expect_status(base + f"/proxy/stream.m3u8?{blocked_query}", "/proxy blocked host", 403)
 
           channels = get_json(base + "/catalog/tv/channels_br.json", "/catalog/tv/channels_br.json")
           assert channels["metas"]

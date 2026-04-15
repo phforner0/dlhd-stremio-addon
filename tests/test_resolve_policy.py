@@ -69,8 +69,8 @@ def test_extract_embed_proxy_manifest_from_url_accepts_new_iframe_hosts(monkeypa
         lambda: _FakeSession("const CHANNEL_KEY = 'premium81'; let M3U8_SERVERS = ['example.test']; server_lookup"),
     )
     monkeypatch.setattr(
-        "app.resolve.player._extract_embed_proxy_manifest",
-        lambda html, timeout=10: ["https://example.test/proxy/premium81/mono.css"],
+        "app.resolve.player._extract_embed_proxy_manifest_with_source",
+        lambda html, timeout=10, source_url=None, player_url=None, player_label=None: ["https://example.test/proxy/premium81/mono.css"],
     )
 
     manifests = _extract_embed_proxy_manifest_from_url(
@@ -87,8 +87,8 @@ def test_extract_embed_proxy_manifest_from_url_accepts_non_premiumtv_paths(monke
         lambda: _FakeSession("const CHANNEL_KEY = 'espnbrazil'; let M3U8_SERVERS = ['example.test']; server_lookup"),
     )
     monkeypatch.setattr(
-        "app.resolve.player._extract_embed_proxy_manifest",
-        lambda html, timeout=10: ["https://example.test/proxy/espnbrazil/mono.css"],
+        "app.resolve.player._extract_embed_proxy_manifest_with_source",
+        lambda html, timeout=10, source_url=None, player_url=None, player_label=None: ["https://example.test/proxy/espnbrazil/mono.css"],
     )
 
     manifests = _extract_embed_proxy_manifest_from_url(
