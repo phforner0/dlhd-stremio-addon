@@ -228,6 +228,22 @@ The service exposes a few environment variables for tuning live stream resolutio
   Optional additive host allowlist for `/proxy` upstream and redirect targets. Built-in provider hosts stay enabled unless strict mode is turned on.
 - `DLHD_PROXY_ALLOWED_HOSTS_STRICT`
   Makes `DLHD_PROXY_ALLOWED_HOSTS` replace the built-in provider allowlist instead of extending it. Default: `0`
+- `DLHD_ARTWORK_ENABLED`
+  Enables dynamic channel/event artwork resolution. Default: `1`
+- `DLHD_ARTWORK_CHANNELS_UPSTREAM`
+  Uses `watch.php` `og:image`/`twitter:image` for channels when available and non-placeholder. Default: `1`
+- `DLHD_ARTWORK_EVENTS_PROVIDER`
+  Event artwork source. Current provider: `thesportsdb`. Default: `thesportsdb`
+- `DLHD_THE_SPORTS_DB_API_KEY`
+  TheSportsDB API key for event artwork search. Default: free test key `3`
+- `DLHD_ARTWORK_ALLOWED_HOSTS`
+  Optional additive allowlist for remote artwork fetches.
+- `DLHD_ARTWORK_ALLOWED_HOSTS_STRICT`
+  Makes `DLHD_ARTWORK_ALLOWED_HOSTS` replace the built-in artwork allowlist. Default: `0`
+- `DLHD_ARTWORK_CACHE_TTL`
+  Metadata cache TTL for resolved artwork sources. Default: `21600`
+- `DLHD_ARTWORK_IMAGE_CACHE_TTL`
+  Binary cache TTL for fetched remote images. Default: `21600`
 - `DLHD_PROXY_MAX_REDIRECTS`
   Caps upstream redirect hops for `/proxy`. Default: `5`
 - `DLHD_PLAYWRIGHT_MAX_CONCURRENCY`
@@ -294,6 +310,16 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_BASE_URL`: upstream site base URL. Default: `https://dlstreams.top`
 - `DLHD_PROXY_ALLOWED_HOSTS`: optional additive allowlist for `/proxy` targets and redirects.
 - `DLHD_PROXY_ALLOWED_HOSTS_STRICT`: replace the built-in provider allowlist instead of extending it. Default: `0`
+- `DLHD_ARTWORK_ENABLED`: enable dynamic channel/event artwork lookup. Default: `1`
+- `DLHD_ARTWORK_CHANNELS_UPSTREAM`: allow channel posters from `watch.php` metadata. Default: `1`
+- `DLHD_ARTWORK_EVENTS_PROVIDER`: event artwork provider. Default: `thesportsdb`
+- `DLHD_THE_SPORTS_DB_API_KEY`: TheSportsDB API key. Default: `3`
+- `DLHD_ARTWORK_ALLOWED_HOSTS`: optional additive allowlist for remote artwork fetches.
+- `DLHD_ARTWORK_ALLOWED_HOSTS_STRICT`: replace the built-in artwork allowlist instead of extending it. Default: `0`
+- `DLHD_ARTWORK_CACHE_TTL`: artwork metadata cache TTL. Default: `21600`
+- `DLHD_ARTWORK_CACHE_MAX_ENTRIES`: artwork metadata cache size. Default: `512`
+- `DLHD_ARTWORK_IMAGE_CACHE_TTL`: remote image binary cache TTL. Default: `21600`
+- `DLHD_ARTWORK_IMAGE_CACHE_MAX_ENTRIES`: remote image binary cache size. Default: `256`
 - `DLHD_PROXY_MAX_REDIRECTS`: max upstream redirects followed by `/proxy`. Default: `5`
 - `DLHD_HTTP_POOL_CONNECTIONS`: pooled upstream HTTP connection count. Default: `32`
 - `DLHD_HTTP_POOL_MAXSIZE`: pooled upstream HTTP max size. Default: `64`

@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.responses import StreamingResponse
 
 from app import settings
+from app.artwork import fetch_artwork_binary, resolve_channel_artwork, resolve_event_artwork, resolve_event_badge_svg
 from app.cache import TTLCache
 from app.http import DEFAULT_HEADERS, build_session, close_pooled_sessions, get_pooled_session, pooled_session_count
 from app.logging_utils import (
@@ -243,6 +244,9 @@ def _log_app_start() -> None:
         http_pool_maxsize=settings.HTTP_POOL_MAXSIZE,
         safe_http_retry_total=settings.SAFE_HTTP_RETRY_TOTAL,
         safe_http_retry_backoff_seconds=settings.SAFE_HTTP_RETRY_BACKOFF_SECONDS,
+        artwork_enabled=settings.ARTWORK_ENABLED,
+        artwork_channels_upstream=settings.ARTWORK_CHANNELS_UPSTREAM_ENABLED,
+        artwork_events_provider=settings.ARTWORK_EVENTS_PROVIDER,
         tls_ignore_global=settings.PLAYWRIGHT_IGNORE_HTTPS_ERRORS,
         tls_ignore_hosts=list(settings.PLAYWRIGHT_IGNORE_HTTPS_ERROR_HOSTS),
         channels_cache_max_entries=settings.CHANNELS_CACHE_MAX_ENTRIES,
@@ -508,7 +512,7 @@ def _valid_hls_stream(manifest_url: str, referer: str) -> bool:
 
 
 def _poster_url(request: Request, meta_id: str) -> str:
-    return f"{_service_base_url(request)}/assets/poster/{quote(meta_id, safe='')}.svg"
+    return f"{_service_base_url(request)}/assets/poster/{quote(meta_id, safe='')}"
 
 
 def _parse_extra(extra: str | None) -> dict[str, str]:
@@ -833,6 +837,98 @@ def _event_poster_subtitle(event: LiveEvent, config: dict[str, str] | None = Non
     if channel_preview:
         parts.append(channel_preview)
     return " | ".join(parts)
+
+
+def _fallback_channel(channel_id: int, title: str) -> CatalogChannel:
+    return CatalogChannel(
+        channel_id=channel_id,
+        name=title,
+        watch_url=f"{settings.BASE_SITE_URL}/watch.php?id={channel_id}",
+        search_hint=None,
+        group_letter=None,
+        country_code="global",
+        country_label=settings.COUNTRY_LABELS["global"],
+    )
+
+
+def _fallback_poster_svg(meta_id: str) -> str:
+    try:
+        kind, value = _parse_meta_id(meta_id)
+    except HTTPException:
+        return render_svg_poster(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
+
+    if kind == "channel":
+        channel = get_channel_index().get(value)
+        wrapper = watch_cache.get(f"watch:{value}")
+        if channel is None:
+            try:
+                wrapper = wrapper or get_wrapper(value)
+            except Exception:
+                wrapper = None
+
+        if channel is None:
+            title = wrapper.channel.name if wrapper is not None and wrapper.channel.name else wrapper.page.title if wrapper is not None else f"Channel {value}"
+            channel = _fallback_channel(value, title)
+        subtitle = _channel_poster_subtitle(channel, wrapper)
+        return render_svg_poster(channel.name, subtitle, channel.country_code)
+
+    event = _find_event(value)
+    if event is None:
+        return render_svg_poster("Live Event", "Unavailable", "global")
+    badge_svg = resolve_event_badge_svg(event)
+    if badge_svg:
+        return badge_svg
+    accent = event.country_codes[0] if event.country_codes else "global"
+    return render_svg_poster(event.title, _event_poster_subtitle(event), accent)
+
+
+def _artwork_response(meta_id: str) -> Response:
+    try:
+        kind, value = _parse_meta_id(meta_id)
+    except HTTPException:
+        svg = render_svg_poster(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
+        return Response(content=svg, media_type="image/svg+xml")
+
+    if kind == "channel":
+        channel = get_channel_index().get(value)
+        if channel is None:
+            wrapper = watch_cache.get(f"watch:{value}")
+            if wrapper is None:
+                try:
+                    wrapper = get_wrapper(value)
+                except Exception:
+                    wrapper = None
+            title = wrapper.channel.name if wrapper is not None and wrapper.channel.name else wrapper.page.title if wrapper is not None else f"Channel {value}"
+            channel = _fallback_channel(value, title)
+        resolution = resolve_channel_artwork(channel, lambda: watch_cache.get(f"watch:{channel.channel_id}") or get_wrapper(channel.channel_id))
+    else:
+        event = _find_event(value)
+        if event is None:
+            svg = render_svg_poster("Live Event", "Unavailable", "global")
+            return Response(content=svg, media_type="image/svg+xml")
+        resolution = resolve_event_artwork(event)
+
+    image_url = resolution.poster_url or resolution.background_url
+    if image_url:
+        try:
+            body, media_type = fetch_artwork_binary(image_url)
+            return Response(content=body, media_type=media_type)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "artwork_fallback_svg",
+                meta_id=meta_id,
+                source=resolution.source,
+                reason=exc.__class__.__name__,
+            )
+
+    if kind == "live":
+        badge_svg = resolve_event_badge_svg(event)
+        if badge_svg:
+            return Response(content=badge_svg, media_type="image/svg+xml")
+
+    return Response(content=_fallback_poster_svg(meta_id), media_type="image/svg+xml")
 
 
 def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
@@ -1785,43 +1881,11 @@ def background() -> Response:
 
 
 @app.get("/assets/poster/{meta_id:path}.svg")
-def poster(meta_id: str) -> Response:
-    try:
-        kind, value = _parse_meta_id(meta_id)
-    except HTTPException:
-        svg = render_svg_poster(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
-        return Response(content=svg, media_type="image/svg+xml")
+def poster_svg(meta_id: str) -> Response:
+    return Response(content=_fallback_poster_svg(meta_id), media_type="image/svg+xml")
 
-    if kind == "channel":
-        channel = get_channel_index().get(value)
-        if channel is None:
-            wrapper = _wrapper_or_http_error(value)
-            title = wrapper.channel.name or wrapper.page.title or f"Channel {value}"
-            fallback_channel = CatalogChannel(
-                channel_id=value,
-                name=title,
-                watch_url=f"{settings.BASE_SITE_URL}/watch.php?id={value}",
-                search_hint=None,
-                group_letter=None,
-                country_code="global",
-                country_label=settings.COUNTRY_LABELS["global"],
-            )
-            subtitle = _channel_poster_subtitle(fallback_channel, wrapper)
-            accent = "global"
-        else:
-            title = channel.name
-            subtitle = _channel_poster_subtitle(channel)
-            accent = channel.country_code
-        svg = render_svg_poster(title, subtitle, accent)
-        return Response(content=svg, media_type="image/svg+xml")
 
-    event = _find_event(value)
-    if event is None:
-        svg = render_svg_poster("Live Event", "Unavailable", "global")
-        return Response(content=svg, media_type="image/svg+xml")
-
-    accent = event.country_codes[0] if event.country_codes else "global"
-    subtitle = _event_poster_subtitle(event)
-    svg = render_svg_poster(event.title, subtitle, accent)
-    return Response(content=svg, media_type="image/svg+xml")
+@app.get("/assets/poster/{meta_id:path}")
+def poster_asset(meta_id: str) -> Response:
+    return _artwork_response(meta_id)
 

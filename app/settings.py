@@ -18,8 +18,7 @@ def _csv_hosts(raw_value: str | None) -> tuple[str, ...]:
     return tuple(host.strip().lower() for host in raw_value.split(",") if host.strip())
 
 
-def _build_proxy_allowed_hosts(raw_value: str | None, *, strict: bool) -> tuple[str, ...]:
-    defaults = default_proxy_allowed_hosts()
+def _merge_allowed_hosts(raw_value: str | None, *, defaults: tuple[str, ...], strict: bool) -> tuple[str, ...]:
     configured = _csv_hosts(raw_value)
     if strict and configured:
         return configured
@@ -30,6 +29,26 @@ def _build_proxy_allowed_hosts(raw_value: str | None, *, strict: bool) -> tuple[
         if host not in merged:
             merged.append(host)
     return tuple(merged)
+
+
+def _default_artwork_allowed_hosts() -> tuple[str, ...]:
+    merged: list[str] = []
+    for host in (
+        *default_proxy_allowed_hosts(),
+        "dlstreams.com",
+        ".dlstreams.com",
+        "r2.thesportsdb.com",
+        ".r2.thesportsdb.com",
+        "www.thesportsdb.com",
+        ".thesportsdb.com",
+    ):
+        if host not in merged:
+            merged.append(host)
+    return tuple(merged)
+
+
+def _build_proxy_allowed_hosts(raw_value: str | None, *, strict: bool) -> tuple[str, ...]:
+    return _merge_allowed_hosts(raw_value, defaults=default_proxy_allowed_hosts(), strict=strict)
 
 BASE_SITE_URL = os.getenv("DLHD_BASE_URL", "https://dlstreams.top").rstrip("/")
 ADDON_ID = os.getenv("DLHD_ADDON_ID", "com.dlhd.stremio")
@@ -49,7 +68,25 @@ RESOURCE_LOG_INTERVAL_SECONDS = int(os.getenv("DLHD_RESOURCE_LOG_INTERVAL_SECOND
 HTTP_TIMEOUT_SECONDS = int(os.getenv("DLHD_HTTP_TIMEOUT", "20"))
 PROXY_MAX_REDIRECTS = int(os.getenv("DLHD_PROXY_MAX_REDIRECTS", "5"))
 PROXY_ALLOWED_HOSTS_STRICT = _env_flag("DLHD_PROXY_ALLOWED_HOSTS_STRICT", False)
-PROXY_ALLOWED_HOSTS = _build_proxy_allowed_hosts(os.getenv("DLHD_PROXY_ALLOWED_HOSTS"), strict=PROXY_ALLOWED_HOSTS_STRICT)
+PROXY_ALLOWED_HOSTS = _merge_allowed_hosts(
+    os.getenv("DLHD_PROXY_ALLOWED_HOSTS"),
+    defaults=default_proxy_allowed_hosts(),
+    strict=PROXY_ALLOWED_HOSTS_STRICT,
+)
+ARTWORK_ENABLED = _env_flag("DLHD_ARTWORK_ENABLED", True)
+ARTWORK_CHANNELS_UPSTREAM_ENABLED = _env_flag("DLHD_ARTWORK_CHANNELS_UPSTREAM", True)
+ARTWORK_EVENTS_PROVIDER = os.getenv("DLHD_ARTWORK_EVENTS_PROVIDER", "thesportsdb").strip().lower()
+ARTWORK_ALLOWED_HOSTS_STRICT = _env_flag("DLHD_ARTWORK_ALLOWED_HOSTS_STRICT", False)
+ARTWORK_ALLOWED_HOSTS = _merge_allowed_hosts(
+    os.getenv("DLHD_ARTWORK_ALLOWED_HOSTS"),
+    defaults=_default_artwork_allowed_hosts(),
+    strict=ARTWORK_ALLOWED_HOSTS_STRICT,
+)
+THE_SPORTS_DB_API_KEY = os.getenv("DLHD_THE_SPORTS_DB_API_KEY", "3").strip() or "3"
+ARTWORK_CACHE_TTL_SECONDS = int(os.getenv("DLHD_ARTWORK_CACHE_TTL", "21600"))
+ARTWORK_CACHE_MAX_ENTRIES = int(os.getenv("DLHD_ARTWORK_CACHE_MAX_ENTRIES", "512"))
+ARTWORK_IMAGE_CACHE_TTL_SECONDS = int(os.getenv("DLHD_ARTWORK_IMAGE_CACHE_TTL", "21600"))
+ARTWORK_IMAGE_CACHE_MAX_ENTRIES = int(os.getenv("DLHD_ARTWORK_IMAGE_CACHE_MAX_ENTRIES", "256"))
 PLAYWRIGHT_WAIT_SECONDS = int(os.getenv("DLHD_PLAYWRIGHT_WAIT", "6"))
 PLAYWRIGHT_TIMEOUT_MS = int(os.getenv("DLHD_PLAYWRIGHT_TIMEOUT_MS", "20000"))
 PLAYWRIGHT_MAX_CONCURRENCY = int(os.getenv("DLHD_PLAYWRIGHT_MAX_CONCURRENCY", "4"))
