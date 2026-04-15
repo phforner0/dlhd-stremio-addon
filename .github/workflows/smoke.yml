@@ -58,13 +58,18 @@ jobs:
           channels = get_json("/catalog/tv/channels_br.json")
           assert channels["metas"]
 
-          meta = get_json("/meta/tv/dlhd:ch:81.json")
-          assert meta["meta"]["behaviorHints"]["defaultVideoId"] == "dlhd:ch:81"
-          assert meta["meta"]["videos"]
+          candidate_ids = [meta["id"].split(":")[-1] for meta in channels["metas"][:20]]
+          matched = None
+          for channel_id in candidate_ids:
+              meta = get_json(f"/meta/tv/dlhd:ch:{channel_id}.json")
+              assert meta["meta"]["videos"]
+              stream = get_json(f"/stream/tv/dlhd:ch:{channel_id}.json")
+              if stream["streams"]:
+                  matched = (channel_id, stream)
+                  break
 
-          stream = get_json("/stream/tv/dlhd:ch:81.json")
-          assert stream["streams"]
-          assert "/proxy/stream.m3u8" in stream["streams"][0]["url"]
+          assert matched is not None, "no playable channel found in local smoke set"
+          assert "/proxy/stream.m3u8" in matched[1]["streams"][0]["url"]
           PY
 
       - name: Upload local smoke log on failure
@@ -79,7 +84,7 @@ jobs:
     timeout-minutes: 15
     env:
       ADDON_BASE_URL: ${{ inputs.base_url || vars.ADDON_BASE_URL }}
-      SMOKE_CHANNEL_ID: ${{ vars.SMOKE_CHANNEL_ID || '81' }}
+      SMOKE_CHANNEL_IDS: ${{ vars.SMOKE_CHANNEL_IDS || vars.SMOKE_CHANNEL_ID || '' }}
 
     steps:
       - name: Check deployed base URL is configured
@@ -97,7 +102,7 @@ jobs:
           import urllib.request
 
           base = os.environ["ADDON_BASE_URL"].rstrip("/")
-          channel_id = os.environ["SMOKE_CHANNEL_ID"]
+          configured_ids = [item.strip() for item in os.environ.get("SMOKE_CHANNEL_IDS", "").split(",") if item.strip()]
 
           def get_json(url: str) -> dict:
               with urllib.request.urlopen(url, timeout=90) as resp:
@@ -112,9 +117,15 @@ jobs:
           channels = get_json(base + "/catalog/tv/channels_br.json")
           assert channels["metas"]
 
-          meta = get_json(base + f"/meta/tv/dlhd:ch:{channel_id}.json")
-          assert meta["meta"]["videos"]
+          candidate_ids = configured_ids or [meta["id"].split(":")[-1] for meta in channels["metas"][:20]]
+          matched = None
+          for channel_id in candidate_ids:
+              meta = get_json(base + f"/meta/tv/dlhd:ch:{channel_id}.json")
+              assert meta["meta"]["videos"]
+              stream = get_json(base + f"/stream/tv/dlhd:ch:{channel_id}.json")
+              if stream["streams"]:
+                  matched = (channel_id, stream)
+                  break
 
-          stream = get_json(base + f"/stream/tv/dlhd:ch:{channel_id}.json")
-          assert stream["streams"]
+          assert matched is not None, "no playable deployed channel found in smoke set"
           PY

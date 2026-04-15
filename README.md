@@ -99,8 +99,8 @@ Repository variables for `smoke.yml`:
 
 - `ADDON_BASE_URL`
   Public addon base URL, for example `https://dlhd-stremio-addon-production.up.railway.app`
-- `SMOKE_CHANNEL_ID`
-  Optional channel used for deployed smoke checks. Default: `81`
+- `SMOKE_CHANNEL_IDS`
+  Optional comma-separated channel IDs for deployed smoke checks. If unset, smoke probes the first channels from `channels_br` until one returns streams.
 
 Repository secrets:
 
@@ -109,7 +109,7 @@ Repository secrets:
 Recommended first setup:
 
 1. add repository variable `ADDON_BASE_URL`
-2. optionally add `SMOKE_CHANNEL_ID`
+2. optionally add `SMOKE_CHANNEL_IDS`
 3. run `Smoke` manually once
 4. keep the scheduled smoke workflow enabled for production monitoring
 
