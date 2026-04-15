@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.models import ChannelInfo, PageInfo, PlayerInfo, PrimaryPlayer, RelatedInfo, SourceInfo, WrapperCatalog
 
 
 def test_catalog_invalid_skip_returns_400() -> None:
@@ -62,6 +63,27 @@ def test_stream_unknown_channel_maps_watch_error_to_not_found(monkeypatch) -> No
     response = client.get("/stream/tv/dlhd:ch:999999.json")
 
     assert response.status_code == 404
+
+
+def test_meta_channel_falls_back_to_wrapper_when_missing_from_index(monkeypatch) -> None:
+    client = TestClient(app)
+    wrapper = WrapperCatalog(
+        source=SourceInfo(input="https://dlstreams.top/watch.php?id=81", type="url"),
+        channel=ChannelInfo(id=81, name="ESPN Brasil", heading="ESPN Brasil (ID 81)"),
+        page=PageInfo(title="ESPN Brasil", description="Sports channel", canonicalUrl="https://dlstreams.top/watch.php?id=81", poster=None),
+        player=PlayerInfo(primary=PrimaryPlayer(label="primary", url=None), alternates=[]),
+        related=RelatedInfo(label=None, channels=[]),
+    )
+
+    monkeypatch.setattr("app.main.get_channel_index", lambda: {})
+    monkeypatch.setattr("app.main.watch_cache.get", lambda key: None)
+    monkeypatch.setattr("app.main._wrapper_or_http_error", lambda channel_id: wrapper)
+
+    response = client.get("/meta/tv/dlhd:ch:81.json")
+
+    assert response.status_code == 200
+    assert response.json()["meta"]["name"] == "ESPN Brasil"
+    assert "/assets/background/" in response.json()["meta"]["background"]
 
 
 def test_invalid_config_token_falls_back_to_default_manifest() -> None:

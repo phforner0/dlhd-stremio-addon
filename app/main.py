@@ -33,7 +33,7 @@ from app.logging_utils import (
 )
 from app.manifest import build_manifest
 from app.models import CatalogChannel, LiveEvent, WrapperCatalog
-from app.posters import render_svg_poster
+from app.posters import render_svg_background, render_svg_poster
 from app.resolve.player import PlaywrightResolver
 from app.scrape.channels import filter_channels, scrape_channels
 from app.scrape.schedule import _display_schedule_values, filter_schedule, scrape_schedule
@@ -515,6 +515,10 @@ def _poster_url(request: Request, meta_id: str) -> str:
     return f"{_service_base_url(request)}/assets/poster/{quote(meta_id, safe='')}"
 
 
+def _background_url(request: Request, meta_id: str) -> str:
+    return f"{_service_base_url(request)}/assets/background/{quote(meta_id, safe='')}"
+
+
 def _parse_extra(extra: str | None) -> dict[str, str]:
     parsed: dict[str, str] = {}
     if not extra:
@@ -851,10 +855,12 @@ def _fallback_channel(channel_id: int, title: str) -> CatalogChannel:
     )
 
 
-def _fallback_poster_svg(meta_id: str) -> str:
+def _fallback_artwork_svg(meta_id: str, *, variant: str) -> str:
     try:
         kind, value = _parse_meta_id(meta_id)
     except HTTPException:
+        if variant == "background":
+            return render_svg_background(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
         return render_svg_poster(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
 
     if kind == "channel":
@@ -870,23 +876,29 @@ def _fallback_poster_svg(meta_id: str) -> str:
             title = wrapper.channel.name if wrapper is not None and wrapper.channel.name else wrapper.page.title if wrapper is not None else f"Channel {value}"
             channel = _fallback_channel(value, title)
         subtitle = _channel_poster_subtitle(channel, wrapper)
+        if variant == "background":
+            return render_svg_background(channel.name, subtitle, channel.country_code)
         return render_svg_poster(channel.name, subtitle, channel.country_code)
 
     event = _find_event(value)
     if event is None:
+        if variant == "background":
+            return render_svg_background("Live Event", "Unavailable", "global")
         return render_svg_poster("Live Event", "Unavailable", "global")
-    badge_svg = resolve_event_badge_svg(event)
+    badge_svg = resolve_event_badge_svg(event, aspect=variant)
     if badge_svg:
         return badge_svg
     accent = event.country_codes[0] if event.country_codes else "global"
+    if variant == "background":
+        return render_svg_background(event.title, _event_poster_subtitle(event), accent)
     return render_svg_poster(event.title, _event_poster_subtitle(event), accent)
 
 
-def _artwork_response(meta_id: str) -> Response:
+def _artwork_response(meta_id: str, *, variant: str) -> Response:
     try:
         kind, value = _parse_meta_id(meta_id)
     except HTTPException:
-        svg = render_svg_poster(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
+        svg = _fallback_artwork_svg(meta_id, variant=variant)
         return Response(content=svg, media_type="image/svg+xml")
 
     if kind == "channel":
@@ -904,11 +916,13 @@ def _artwork_response(meta_id: str) -> Response:
     else:
         event = _find_event(value)
         if event is None:
-            svg = render_svg_poster("Live Event", "Unavailable", "global")
+            svg = _fallback_artwork_svg(meta_id, variant=variant)
             return Response(content=svg, media_type="image/svg+xml")
         resolution = resolve_event_artwork(event)
 
-    image_url = resolution.poster_url or resolution.background_url
+    image_url = resolution.poster_url if variant == "poster" else resolution.background_url
+    if image_url is None and variant == "poster":
+        image_url = resolution.background_url
     if image_url:
         try:
             body, media_type = fetch_artwork_binary(image_url)
@@ -924,11 +938,11 @@ def _artwork_response(meta_id: str) -> Response:
             )
 
     if kind == "live":
-        badge_svg = resolve_event_badge_svg(event)
+        badge_svg = resolve_event_badge_svg(event, aspect=variant)
         if badge_svg:
             return Response(content=badge_svg, media_type="image/svg+xml")
 
-    return Response(content=_fallback_poster_svg(meta_id), media_type="image/svg+xml")
+    return Response(content=_fallback_artwork_svg(meta_id, variant=variant), media_type="image/svg+xml")
 
 
 def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
@@ -985,7 +999,7 @@ def _channel_preview(channel: CatalogChannel, request: Request) -> dict:
         "type": "tv",
         "name": channel.name,
         "poster": _poster_url(request, channel.meta_id),
-        "background": _poster_url(request, channel.meta_id),
+        "background": _background_url(request, channel.meta_id),
         "posterShape": "poster",
         "description": _channel_description(channel),
         "genres": [channel.country_label],
@@ -1001,7 +1015,7 @@ def _event_preview(event: LiveEvent, request: Request, config: dict[str, str]) -
         "type": "tv",
         "name": event.title,
         "poster": _poster_url(request, event.meta_id),
-        "background": _poster_url(request, event.meta_id),
+        "background": _background_url(request, event.meta_id),
         "posterShape": "poster",
         "description": _event_description(event, config, detailed=False),
         "genres": [event.category, *country_labels],
@@ -1593,10 +1607,10 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
             except HTTPException:
                 log_event(LOGGER, logging.WARNING, "meta_not_found", **request_fields, kind=kind, channel_id=channel_id)
                 raise
-                channel = CatalogChannel(
-                    channel_id=channel_id,
-                    name=wrapper.channel.name or wrapper.page.title or f"Channel {channel_id}",
-                    watch_url=f"{settings.BASE_SITE_URL}/watch.php?id={channel_id}",
+            channel = CatalogChannel(
+                channel_id=channel_id,
+                name=wrapper.channel.name or wrapper.page.title or f"Channel {channel_id}",
+                watch_url=f"{settings.BASE_SITE_URL}/watch.php?id={channel_id}",
                 search_hint=None,
                 group_letter=None,
                 country_code="global",
@@ -1609,7 +1623,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
             "name": channel.name,
             "poster": _poster_url(request, channel.meta_id),
             "posterShape": "poster",
-            "background": _poster_url(request, channel.meta_id),
+            "background": _background_url(request, channel.meta_id),
             "description": _channel_description(channel, wrapper),
             "genres": [channel.country_label],
             "releaseInfo": channel.country_label,
@@ -1631,7 +1645,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
         "name": event.title,
         "poster": _poster_url(request, event.meta_id),
         "posterShape": "poster",
-        "background": _poster_url(request, event.meta_id),
+        "background": _background_url(request, event.meta_id),
         "description": _event_description(event, user_config, detailed=True),
         "genres": [event.category, *_event_country_labels(event)],
         "releaseInfo": f"{event_day_label} {event_time_text}",
@@ -1876,16 +1890,26 @@ def logo() -> Response:
 
 @app.get("/assets/background.svg")
 def background() -> Response:
-    svg = render_svg_poster(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
+    svg = render_svg_background(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
     return Response(content=svg, media_type="image/svg+xml")
+
+
+@app.get("/assets/background/{meta_id:path}.svg")
+def background_svg(meta_id: str) -> Response:
+    return Response(content=_fallback_artwork_svg(meta_id, variant="background"), media_type="image/svg+xml")
+
+
+@app.get("/assets/background/{meta_id:path}")
+def background_asset(meta_id: str) -> Response:
+    return _artwork_response(meta_id, variant="background")
 
 
 @app.get("/assets/poster/{meta_id:path}.svg")
 def poster_svg(meta_id: str) -> Response:
-    return Response(content=_fallback_poster_svg(meta_id), media_type="image/svg+xml")
+    return Response(content=_fallback_artwork_svg(meta_id, variant="poster"), media_type="image/svg+xml")
 
 
 @app.get("/assets/poster/{meta_id:path}")
 def poster_asset(meta_id: str) -> Response:
-    return _artwork_response(meta_id)
+    return _artwork_response(meta_id, variant="poster")
 

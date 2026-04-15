@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 import re
 from textwrap import wrap
+from typing import TypeVar
 import unicodedata
 from urllib.parse import urljoin, urlparse
 from xml.sax.saxutils import escape
@@ -25,6 +27,8 @@ EVENT_BADGE_SVG_CACHE: TTLCache[str | None] = TTLCache(max_entries=settings.ARTW
 TEAM_ARTWORK_CACHE: TTLCache[tuple[str | None, str | None]] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="team_artwork")
 IMAGE_BINARY_CACHE: TTLCache[tuple[bytes, str]] = TTLCache(max_entries=settings.ARTWORK_IMAGE_CACHE_MAX_ENTRIES, name="artwork_image")
 PLACEHOLDER_POSTER_PATHS = {"/assets/logos/logo.png"}
+PLACEHOLDER_POSTER_RE = re.compile(r"/(?:logo|default|placeholder)(?:\.[a-z0-9]+)?$", re.I)
+PLACEHOLDER_POSTER_HOSTS = {"dlstreams.com", "www.dlstreams.com", "dlstreams.top", "www.dlstreams.top"}
 VS_RE = re.compile(r"\b(vs\.?|v\.?|x)\b", re.I)
 SPORT_ALIASES = {
     "football": "soccer",
@@ -49,6 +53,29 @@ class ArtworkResolution:
     poster_url: str | None
     background_url: str | None
     source: str
+
+
+_T = TypeVar("_T")
+
+
+def _remember_cached_artwork(cache: TTLCache[ArtworkResolution], key: str, factory: Callable[[], ArtworkResolution]) -> ArtworkResolution:
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    resolution = factory()
+    ttl = settings.ARTWORK_CACHE_TTL_SECONDS if (resolution.poster_url or resolution.background_url) else settings.ARTWORK_MISS_CACHE_TTL_SECONDS
+    cache.set(key, resolution, ttl)
+    return resolution
+
+
+def _remember_cached_optional(cache: TTLCache[_T | None], key: str, factory: Callable[[], _T | None]) -> _T | None:
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    value = factory()
+    ttl = settings.ARTWORK_CACHE_TTL_SECONDS if value else settings.ARTWORK_MISS_CACHE_TTL_SECONDS
+    cache.set(key, value, ttl)
+    return value
 
 
 def _host_matches(host: str, allowed: str) -> bool:
@@ -78,7 +105,13 @@ def _placeholder_channel_poster(url: str | None) -> bool:
     if not url:
         return True
     parsed = urlparse(url)
-    return parsed.path.lower() in PLACEHOLDER_POSTER_PATHS
+    path = parsed.path.lower()
+    host = (parsed.hostname or "").lower()
+    if path in PLACEHOLDER_POSTER_PATHS:
+        return True
+    if host in PLACEHOLDER_POSTER_HOSTS and path.startswith("/assets/logos/") and PLACEHOLDER_POSTER_RE.search(path):
+        return True
+    return False
 
 
 def _artwork_url_allowed(url: str | None) -> bool:
@@ -121,9 +154,9 @@ def resolve_channel_artwork(channel: CatalogChannel, wrapper_fetcher) -> Artwork
         if _placeholder_channel_poster(poster_url) or not _artwork_url_allowed(poster_url):
             return ArtworkResolution(None, None, "svg")
 
-        return ArtworkResolution(poster_url=poster_url, background_url=poster_url, source="watch_page")
+        return ArtworkResolution(poster_url=poster_url, background_url=None, source="watch_page")
 
-    return CHANNEL_ARTWORK_CACHE.remember(cache_key, settings.ARTWORK_CACHE_TTL_SECONDS, factory)
+    return _remember_cached_artwork(CHANNEL_ARTWORK_CACHE, cache_key, factory)
 
 
 def _normalize_event_text(value: str) -> str:
@@ -281,9 +314,8 @@ def _event_artwork_urls(payload: dict) -> tuple[str | None, str | None]:
     background_url = _first_non_empty(
         [
             _normalized_remote_url(payload.get("strBanner")),
-            _normalized_remote_url(payload.get("strThumb")),
-            _normalized_remote_url(payload.get("strPoster")),
             _normalized_remote_url(payload.get("strFanart")),
+            _normalized_remote_url(payload.get("strThumb")),
         ]
     )
     return poster_url, background_url
@@ -300,6 +332,32 @@ def _search_event_artwork(query: str) -> list[dict]:
         return []
     events = payload.get("event")
     return events if isinstance(events, list) else []
+
+
+def _best_event_candidate(event: LiveEvent, *, minimum_score: int) -> tuple[int, dict] | None:
+    best_match: tuple[int, dict] | None = None
+    for query in _event_search_queries(event):
+        try:
+            candidates = _search_event_artwork(query)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "event_artwork_search_failed",
+                event_id=event.meta_id,
+                query=query,
+                reason=exc.__class__.__name__,
+            )
+            continue
+
+        for candidate in candidates:
+            score = _candidate_score(event, query, candidate)
+            if best_match is None or score > best_match[0]:
+                best_match = (score, candidate)
+
+    if best_match is None or best_match[0] < minimum_score:
+        return None
+    return best_match
 
 
 def _search_team_artwork(query: str) -> list[dict]:
@@ -366,7 +424,7 @@ def _best_team_artwork(team_name: str, sport_hint: str | None) -> tuple[str | No
             fanart_url if _artwork_url_allowed(fanart_url) else None,
         )
 
-    return TEAM_ARTWORK_CACHE.remember(cache_key, settings.ARTWORK_CACHE_TTL_SECONDS, factory)
+    return _remember_cached_optional(TEAM_ARTWORK_CACHE, cache_key, factory) or (None, None)
 
 
 def _image_data_uri(url: str | None) -> str | None:
@@ -399,72 +457,117 @@ def _svg_text(lines: list[str], *, x: int, start_y: int, line_height: int, font_
     )
 
 
-def _compose_event_badge_svg(event: LiveEvent, left_name: str, right_name: str, left_badge: str | None, right_badge: str | None) -> str | None:
-    left_data = _image_data_uri(left_badge) if left_badge else None
-    right_data = _image_data_uri(right_badge) if right_badge else None
-    if not left_data and not right_data:
+def _compose_event_badge_svg(event: LiveEvent, badges: list[tuple[str, str]], *, aspect: str) -> str | None:
+    if not badges:
         return None
 
     accent_code = event.country_codes[0] if event.country_codes else "global"
     accent = settings.COUNTRY_COLORS.get(accent_code, settings.COUNTRY_COLORS["global"])
     league_hint = _event_league_hint(event) or event.category
     subtitle = f"{event.day_label} | {event.time_text} | {league_hint}"
-    title_lines = _wrapped_lines(event.title, width=22, max_lines=3)
-    subtitle_lines = _wrapped_lines(subtitle, width=34, max_lines=2)
-    left_name_lines = _wrapped_lines(left_name, width=14, max_lines=2)
-    right_name_lines = _wrapped_lines(right_name, width=14, max_lines=2)
-    left_image = f'<image href="{left_data}" x="86" y="278" width="164" height="164" preserveAspectRatio="xMidYMid meet"/>' if left_data else ""
-    right_image = f'<image href="{right_data}" x="350" y="278" width="164" height="164" preserveAspectRatio="xMidYMid meet"/>' if right_data else ""
 
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="600" height="900" viewBox="0 0 600 900" role="img" aria-label="{escape(event.title)}">
+    if aspect == "background":
+        width = 1600
+        height = 900
+        view_box = "0 0 1600 900"
+        title_lines = _wrapped_lines(event.title, width=28, max_lines=3)
+        subtitle_lines = _wrapped_lines(subtitle, width=68, max_lines=2)
+        title_block = _svg_text(title_lines, x=96, start_y=160, line_height=72, font_size=58, fill="#f8fafc", weight=700)
+        subtitle_block = _svg_text(subtitle_lines, x=96, start_y=414, line_height=38, font_size=30, fill="#dbe4f0", weight=500)
+        image_y = 518
+        slots = [(370, 220), (1010, 220)] if len(badges) >= 2 else [(690, 220)]
+        name_y = image_y + 284
+        footer_y = 812
+    else:
+        width = 600
+        height = 900
+        view_box = "0 0 600 900"
+        title_lines = _wrapped_lines(event.title, width=22, max_lines=3)
+        subtitle_lines = _wrapped_lines(subtitle, width=34, max_lines=2)
+        title_block = _svg_text(title_lines, x=72, start_y=128, line_height=54, font_size=44, fill="#f8fafc", weight=700)
+        subtitle_block = _svg_text(subtitle_lines, x=72, start_y=636, line_height=30, font_size=24, fill="#cbd5e1", weight=500)
+        image_y = 278
+        slots = [(78, 164), (342, 164)] if len(badges) >= 2 else [(210, 164)]
+        name_y = image_y + 214
+        footer_y = 824
+
+    cards = []
+    for index, (name, image_data) in enumerate(badges[:2]):
+        x, size = slots[min(index, len(slots) - 1)]
+        cards.append(f'<rect x="{x}" y="{image_y - 38}" width="{size + 16}" height="{size + 50}" rx="28" fill="#0f172a" stroke="#243041"/>')
+        cards.append(f'<image href="{image_data}" x="{x + 8}" y="{image_y}" width="{size}" height="{size}" preserveAspectRatio="xMidYMid meet"/>')
+        cards.append(_svg_text(_wrapped_lines(name, width=16 if aspect == "background" else 14, max_lines=2), x=x + 14, start_y=name_y, line_height=26, font_size=22, fill="#e2e8f0", weight=700))
+
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{view_box}" role="img" aria-label="{escape(event.title)}">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#0f172a"/>
       <stop offset="100%" stop-color="#020617"/>
     </linearGradient>
   </defs>
-  <rect width="600" height="900" fill="url(#bg)"/>
-  <rect x="38" y="38" width="524" height="824" rx="34" fill="#08111f" stroke="#1e293b" stroke-width="2"/>
-  <rect x="38" y="38" width="524" height="18" rx="9" fill="{accent}"/>
-  <rect x="78" y="240" width="180" height="214" rx="28" fill="#0f172a" stroke="#243041"/>
-  <rect x="342" y="240" width="180" height="214" rx="28" fill="#0f172a" stroke="#243041"/>
-  {left_image}
-  {right_image}
-  {_svg_text(left_name_lines, x=92, start_y=492, line_height=26, font_size=22, fill="#e2e8f0", weight=700)}
-  {_svg_text(right_name_lines, x=356, start_y=492, line_height=26, font_size=22, fill="#e2e8f0", weight=700)}
-  {_svg_text(title_lines, x=72, start_y=128, line_height=54, font_size=44, fill="#f8fafc", weight=700)}
-  <rect x="72" y="584" width="456" height="2" rx="1" fill="#243041"/>
-  {_svg_text(subtitle_lines, x=72, start_y=636, line_height=30, font_size=24, fill="#cbd5e1", weight=500)}
-  <text x="72" y="824" fill="#64748b" font-size="18" font-weight="600" font-family="Arial, Helvetica, sans-serif">EVENT ARTWORK FALLBACK</text>
+  <rect width="{width}" height="{height}" fill="url(#bg)"/>
+  <rect x="38" y="38" width="{width - 76}" height="{height - 76}" rx="34" fill="#08111f" stroke="#1e293b" stroke-width="2"/>
+  <rect x="38" y="38" width="{width - 76}" height="18" rx="9" fill="{accent}"/>
+  {title_block}
+  <rect x="72" y="{584 if aspect != 'background' else 362}" width="{456 if aspect != 'background' else 1120}" height="2" rx="1" fill="#243041"/>
+  {subtitle_block}
+  {''.join(cards)}
+  <text x="72" y="{footer_y}" fill="#64748b" font-size="18" font-weight="600" font-family="Arial, Helvetica, sans-serif">EVENT ARTWORK FALLBACK</text>
 </svg>"""
 
 
-def resolve_event_badge_svg(event: LiveEvent) -> str | None:
+def _league_badge_svg(event: LiveEvent, payload: dict, *, aspect: str) -> str | None:
+    badge_url = _normalized_remote_url(payload.get("strLeagueBadge"))
+    if not _artwork_url_allowed(badge_url):
+        return None
+    badge_data = _image_data_uri(badge_url)
+    if not badge_data:
+        return None
+    league_name = str(payload.get("strLeague") or event.category or "Live Event")
+    return _compose_event_badge_svg(event, [(league_name, badge_data)], aspect=aspect)
+
+
+def resolve_event_badge_svg(event: LiveEvent, *, aspect: str = "poster") -> str | None:
     cache_key = f"event-badge:{event.meta_id}"
+    if aspect != "poster":
+        cache_key = f"{cache_key}:{aspect}"
 
     def factory() -> str | None:
         matchup = _event_matchup(event)
-        if matchup is None:
-            return None
-
         sport_hint = _event_sport_hint(event)
-        left_name, right_name = matchup
-        try:
-            left_badge, _ = _best_team_artwork(left_name, sport_hint)
-            right_badge, _ = _best_team_artwork(right_name, sport_hint)
-        except Exception as exc:  # noqa: BLE001
-            log_event(
-                LOGGER,
-                logging.DEBUG,
-                "event_badge_artwork_failed",
-                event_id=event.meta_id,
-                reason=exc.__class__.__name__,
-            )
-            return None
+        if matchup is not None:
+            left_name, right_name = matchup
+            try:
+                left_badge, _ = _best_team_artwork(left_name, sport_hint)
+                right_badge, _ = _best_team_artwork(right_name, sport_hint)
+                badges: list[tuple[str, str]] = []
+                if left_badge:
+                    left_data = _image_data_uri(left_badge)
+                    if left_data:
+                        badges.append((left_name, left_data))
+                if right_badge:
+                    right_data = _image_data_uri(right_badge)
+                    if right_data:
+                        badges.append((right_name, right_data))
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    logging.DEBUG,
+                    "event_badge_artwork_failed",
+                    event_id=event.meta_id,
+                    reason=exc.__class__.__name__,
+                )
+                badges = []
 
-        return _compose_event_badge_svg(event, left_name, right_name, left_badge, right_badge)
+            if badges:
+                return _compose_event_badge_svg(event, badges, aspect=aspect)
 
-    return EVENT_BADGE_SVG_CACHE.remember(cache_key, settings.ARTWORK_CACHE_TTL_SECONDS, factory)
+        best_match = _best_event_candidate(event, minimum_score=45)
+        if best_match is not None:
+            return _league_badge_svg(event, best_match[1], aspect=aspect)
+        return None
+
+    return _remember_cached_optional(EVENT_BADGE_SVG_CACHE, cache_key, factory)
 
 
 def resolve_event_artwork(event: LiveEvent) -> ArtworkResolution:
@@ -474,40 +577,23 @@ def resolve_event_artwork(event: LiveEvent) -> ArtworkResolution:
         if not settings.ARTWORK_ENABLED or settings.ARTWORK_EVENTS_PROVIDER != "thesportsdb":
             return ArtworkResolution(None, None, "disabled")
 
-        best_match: tuple[int, dict] | None = None
-        for query in _event_search_queries(event):
-            try:
-                candidates = _search_event_artwork(query)
-            except Exception as exc:  # noqa: BLE001
-                log_event(
-                    LOGGER,
-                    logging.DEBUG,
-                    "event_artwork_search_failed",
-                    event_id=event.meta_id,
-                    query=query,
-                    reason=exc.__class__.__name__,
-                )
-                continue
-
-            for candidate in candidates:
-                score = _candidate_score(event, query, candidate)
-                if best_match is None or score > best_match[0]:
-                    best_match = (score, candidate)
-
-        if best_match is None or best_match[0] < 70:
+        best_match = _best_event_candidate(event, minimum_score=70)
+        if best_match is None:
             return ArtworkResolution(None, None, "svg")
 
         poster_url, background_url = _event_artwork_urls(best_match[1])
-        if not _artwork_url_allowed(poster_url) and not _artwork_url_allowed(background_url):
+        poster_url = poster_url if _artwork_url_allowed(poster_url) else None
+        background_url = background_url if _artwork_url_allowed(background_url) else None
+        if not poster_url and not background_url:
             return ArtworkResolution(None, None, "svg")
 
         return ArtworkResolution(
-            poster_url=poster_url if _artwork_url_allowed(poster_url) else background_url,
-            background_url=background_url if _artwork_url_allowed(background_url) else poster_url,
+            poster_url=poster_url,
+            background_url=background_url,
             source="thesportsdb",
         )
 
-    return EVENT_ARTWORK_CACHE.remember(cache_key, settings.ARTWORK_CACHE_TTL_SECONDS, factory)
+    return _remember_cached_artwork(EVENT_ARTWORK_CACHE, cache_key, factory)
 
 
 def fetch_artwork_binary(url: str) -> tuple[bytes, str]:

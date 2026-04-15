@@ -71,3 +71,40 @@ def render_svg_poster(title: str, subtitle: str, accent_code: str) -> str:
   {subtitle_block}
   <text x="72" y="828" fill="#64748b" font-size="18" font-weight="600" font-family="Arial, Helvetica, sans-serif">{escape(settings.ADDON_NAME.upper()[:36])}</text>
 </svg>"""
+
+
+def render_svg_background(title: str, subtitle: str, accent_code: str) -> str:
+    accent = settings.COUNTRY_COLORS.get(accent_code, settings.COUNTRY_COLORS["global"])
+    safe_title = title[:120] or settings.ADDON_NAME
+    safe_subtitle = subtitle[:220] or settings.ADDON_DESCRIPTION
+    title_lines = _wrapped_lines(safe_title, width=28, max_lines=3)
+    subtitle_lines = _wrapped_lines(safe_subtitle, width=68, max_lines=3)
+    title_block = _text_block(title_lines, x=96, start_y=280, line_height=88, font_size=76, weight=700, fill="#f8fafc")
+    subtitle_block = _text_block(subtitle_lines, x=96, start_y=576, line_height=42, font_size=32, weight=400, fill="#dbe4f0")
+    safe_label = escape(safe_title)
+
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-label="{safe_label}">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#020617"/>
+      <stop offset="52%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="accentGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="{accent}" stop-opacity="0.65"/>
+      <stop offset="100%" stop-color="{accent}" stop-opacity="0.10"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <circle cx="1300" cy="180" r="260" fill="url(#accentGlow)"/>
+  <circle cx="180" cy="760" r="180" fill="{accent}" opacity="0.10"/>
+  <rect x="54" y="54" width="1492" height="792" rx="40" fill="#08111f" stroke="#1e293b" stroke-width="2"/>
+  <rect x="54" y="54" width="1492" height="22" rx="11" fill="{accent}"/>
+  <rect x="96" y="104" width="168" height="48" rx="24" fill="{accent}" opacity="0.92"/>
+  <text x="124" y="136" fill="#020617" font-size="24" font-weight="700" font-family="Arial, Helvetica, sans-serif">DLHD LIVE</text>
+  <text x="96" y="198" fill="#93c5fd" font-size="28" font-weight="700" font-family="Arial, Helvetica, sans-serif">STREMIO ADDON</text>
+  {title_block}
+  <rect x="96" y="520" width="1120" height="2" rx="1" fill="#243041"/>
+  {subtitle_block}
+  <text x="96" y="792" fill="#64748b" font-size="24" font-weight="600" font-family="Arial, Helvetica, sans-serif">{escape(settings.ADDON_NAME.upper()[:48])}</text>
+</svg>"""

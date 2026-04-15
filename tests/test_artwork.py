@@ -15,6 +15,7 @@ from app.artwork import (
     resolve_event_badge_svg,
     resolve_event_artwork,
 )
+from app import settings
 from app.models import (
     CatalogChannel,
     ChannelInfo,
@@ -67,7 +68,7 @@ def test_resolve_channel_artwork_uses_real_upstream_poster() -> None:
     resolution = resolve_channel_artwork(channel, lambda: _wrapper(poster="https://dlstreams.com/assets/logos/espn-brasil.png"))
 
     assert resolution.poster_url == "https://dlstreams.com/assets/logos/espn-brasil.png"
-    assert resolution.background_url == resolution.poster_url
+    assert resolution.background_url is None
     assert resolution.source == "watch_page"
 
 
@@ -160,6 +161,28 @@ def test_resolve_event_artwork_falls_back_when_no_strong_match(monkeypatch) -> N
     resolution = resolve_event_artwork(event)
 
     assert resolution == ArtworkResolution(None, None, "svg")
+
+
+def test_event_artwork_fallback_uses_shorter_miss_ttl(monkeypatch) -> None:
+    event = LiveEvent(
+        meta_id="dlhd:live:event-miss-ttl",
+        title="Premier League / La Liga / Bundesliga League Matches (Football Season), May June 2026",
+        time_text="18:00",
+        day_label="Today",
+        category="Upcoming Events",
+        channels=[],
+        country_codes=["global"],
+        scheduled_at_utc=datetime(2026, 4, 15, 18, 0, tzinfo=timezone.utc),
+    )
+    cache_key = f"event:{event.meta_id}"
+    EVENT_ARTWORK_CACHE.delete(cache_key)
+    monkeypatch.setattr("app.artwork._search_event_artwork", lambda query: [])
+    monkeypatch.setattr("app.cache.time.time", lambda: 1000.0)
+
+    resolve_event_artwork(event)
+
+    entry = EVENT_ARTWORK_CACHE._entries[cache_key]
+    assert round(entry.expires_at - 1000.0) == settings.ARTWORK_MISS_CACHE_TTL_SECONDS
 
 
 def test_resolve_event_badge_svg_builds_composed_svg_from_team_badges(monkeypatch) -> None:
