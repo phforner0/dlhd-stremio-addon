@@ -15,6 +15,7 @@ from app import settings
 from app.http import DEFAULT_HEADERS, build_session
 from app.logging_utils import log_event, proxy_url_fields
 from app.models import ManifestResult, PlayerResolution, WrapperCatalog
+from app.resolve.providers import should_attempt_bootstrap_fetch
 
 LOGGER = logging.getLogger("dlhd.resolve")
 
@@ -205,6 +206,8 @@ def _extract_embed_proxy_manifest(html: str, timeout: int = 10) -> list[str]:
 def _extract_embed_proxy_manifest_from_url(url: str, referer: str, timeout: int = 10) -> list[str]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return []
+    if not should_attempt_bootstrap_fetch(url):
         return []
 
     try:

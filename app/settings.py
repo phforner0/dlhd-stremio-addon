@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 
+from app.resolve.providers import default_proxy_allowed_hosts
+
 
 def _env_flag(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -30,22 +32,7 @@ PROXY_ALLOWED_HOSTS = tuple(
     host.strip().lower()
     for host in os.getenv(
         "DLHD_PROXY_ALLOWED_HOSTS",
-        ",".join(
-            [
-                "dlstreams.top",
-                ".dlstreams.top",
-                "embedkclx.sbs",
-                ".embedkclx.sbs",
-                "enviromentalspa2.sbs",
-                ".enviromentalspa2.sbs",
-                "viewembed.ru",
-                ".viewembed.ru",
-                "soyspace.cyou",
-                ".soyspace.cyou",
-                "vid.aivideox.site",
-                ".aivideox.site",
-            ]
-        ),
+        ",".join(default_proxy_allowed_hosts()),
     ).split(",")
     if host.strip()
 )

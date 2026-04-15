@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import base64
 from datetime import datetime, timezone
 import ipaddress
 import json
@@ -38,6 +37,17 @@ from app.resolve.player import PlaywrightResolver
 from app.scrape.channels import filter_channels, scrape_channels
 from app.scrape.schedule import _display_schedule_values, filter_schedule, scrape_schedule
 from app.scrape.watch import WatchFetchError, fetch_wrapper
+from app.user_config import (
+    catalog_mode as user_catalog_mode,
+    channel_stream_result_limit as user_channel_stream_result_limit,
+    configure_select_fields,
+    encode_user_config,
+    event_stale_after_minutes as user_event_stale_after_minutes,
+    live_stream_result_limit as user_live_stream_result_limit,
+    parse_user_config as parse_user_config_input,
+    preferred_country_code as user_preferred_country_code,
+    schedule_offset_minutes as user_schedule_offset_minutes,
+)
 
 configure_logging()
 
@@ -501,88 +511,55 @@ def _parse_extra(extra: str | None) -> dict[str, str]:
 
 
 def _parse_user_config(config: str | None) -> dict[str, str]:
-    if not config:
-        return {}
+    parsed, _ = parse_user_config_input(config)
+    return parsed
 
-    if config.startswith("cfg-"):
-        return _decode_user_config_token(config)
 
-    try:
-        parsed = json.loads(config)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-    if not isinstance(parsed, dict):
-        return {}
-
-    normalized: dict[str, str] = {}
-    for key, value in parsed.items():
-        if isinstance(value, (str, int, float, bool)):
-            normalized[str(key)] = str(value)
-    return normalized
+def _parse_user_config_for_request(request: Request, config: str | None) -> dict[str, str]:
+    parsed, issues = parse_user_config_input(config)
+    if config and issues:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "invalid_user_config",
+            **_request_log_fields(request),
+            config_issues=issues,
+            user_config_hash=config_fingerprint(parsed),
+        )
+    return parsed
 
 
 def _decode_user_config_token(config: str) -> dict[str, str]:
-    token = config.removeprefix("cfg-")
-    padding = "=" * (-len(token) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(token + padding).decode("utf-8")
-    except Exception:
-        return {}
-    return _parse_user_config(decoded)
+    parsed, _ = parse_user_config_input(config)
+    return parsed
 
 
 def _encode_user_config(config: dict[str, str]) -> str:
-    raw = json.dumps(config, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return "cfg-" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return encode_user_config(config)
 
 
 def _schedule_offset_minutes(config: dict[str, str]) -> int:
-    raw_value = config.get("scheduleOffsetMin")
-    if raw_value is None:
-        return settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES
-
-    raw_minutes = raw_value.split("|", 1)[0]
-    try:
-        return int(raw_minutes)
-    except ValueError:
-        return settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES
-
-
-def _int_config_value(config: dict[str, str], key: str, default: int, allowed: set[int]) -> int:
-    raw_value = config.get(key)
-    if raw_value is None:
-        return default
-
-    raw_number = raw_value.split("|", 1)[0]
-    try:
-        parsed = int(raw_number)
-    except ValueError:
-        return default
-    return parsed if parsed in allowed else default
+    return user_schedule_offset_minutes(config)
 
 
 def _catalog_mode(config: dict[str, str]) -> str:
-    return config.get("catalogMode", "full").split("|", 1)[0]
+    return user_catalog_mode(config)
 
 
 def _preferred_country_code(config: dict[str, str]) -> str | None:
-    raw_value = config.get("preferredCountryCode", "all").split("|", 1)[0]
-    if raw_value in {"", "all"}:
-        return None
-    return raw_value if raw_value in settings.COUNTRY_LABELS else None
+    return user_preferred_country_code(config)
 
 
 def _channel_stream_result_limit(config: dict[str, str]) -> int:
-    return _int_config_value(config, "channelStreamResults", settings.CHANNEL_STREAM_MAX_RESULTS, {1, 2})
+    return user_channel_stream_result_limit(config)
 
 
 def _live_stream_result_limit(config: dict[str, str]) -> int:
-    return _int_config_value(config, "liveStreamResults", settings.LIVE_STREAM_MAX_RESULTS, {1, 2, 4})
+    return user_live_stream_result_limit(config)
 
 
 def _event_stale_after_minutes(config: dict[str, str]) -> int:
-    return _int_config_value(config, "eventStaleAfterMinutes", settings.EVENT_STALE_AFTER_MINUTES, {120, 360, 720})
+    return user_event_stale_after_minutes(config)
 
 
 def _config_fingerprint(config: dict[str, str], keys: tuple[str, ...]) -> str:
@@ -613,26 +590,13 @@ def _configure_page_v2(request: Request) -> str:
             rendered.append(f'<option value="{value}"{selected}>{label}</option>')
         return f'<label for="{field_id}">{title}</label><select id="{field_id}">{"".join(rendered)}</select>'
 
-    timezone_options = []
-    for minutes in range(-12 * 60, 14 * 60 + 1, 30):
-        sign = "+" if minutes >= 0 else "-"
-        absolute = abs(minutes)
-        hours = absolute // 60
-        mins = absolute % 60
-        timezone_options.append((str(minutes), f"GMT {sign}{hours:02d}:{mins:02d}"))
-
-    country_options = [("all", "All Countries")]
-    for country_code in settings.VISIBLE_COUNTRY_CODES:
-        country_options.append((country_code, settings.COUNTRY_LABELS[country_code]))
+    field_defs = configure_select_fields()
+    field_ids = json.dumps([field["key"] for field in field_defs])
 
     fields_html = "".join(
         [
-            select_html("scheduleOffsetMin", "Schedule Timezone", timezone_options, str(settings.SCHEDULE_DISPLAY_GMT_OFFSET_MINUTES)),
-            select_html("catalogMode", "Catalog Mode", [("full", "All catalogs"), ("focused", "Only all + one country + global")], "full"),
-            select_html("preferredCountryCode", "Preferred Country", country_options, "all"),
-            select_html("channelStreamResults", "Channel Stream Options", [("1", "Best only"), ("2", "Two options")], str(settings.CHANNEL_STREAM_MAX_RESULTS)),
-            select_html("liveStreamResults", "Live Stream Options", [("1", "Best only"), ("2", "Two options"), ("4", "More options")], str(settings.LIVE_STREAM_MAX_RESULTS)),
-            select_html("eventStaleAfterMinutes", "Hide Finished Events After", [("120", "2 hours"), ("360", "6 hours"), ("720", "12 hours")], str(settings.EVENT_STALE_AFTER_MINUTES)),
+            select_html(field["key"], field["title"], field["options"], field["default"])
+            for field in field_defs
         ]
     )
 
@@ -666,7 +630,7 @@ def _configure_page_v2(request: Request) -> str:
   <p class=\"help\">If the install button opens a page-not-found screen, copy the manifest URL below and paste it manually inside Stremio.</p>
   <code id=\"manifestUrl\"></code>
   <script>
-    const fields = ['scheduleOffsetMin', 'catalogMode', 'preferredCountryCode', 'channelStreamResults', 'liveStreamResults', 'eventStaleAfterMinutes']
+    const fields = {field_ids}
       .map((id) => document.getElementById(id));
     const installBtn = document.getElementById('installBtn');
     const copyBtn = document.getElementById('copyBtn');
@@ -1346,7 +1310,7 @@ def healthz() -> dict:
 @app.get("/manifest.json")
 @app.get("/{config}/manifest.json")
 def manifest(request: Request, config: str | None = None) -> JSONResponse:
-    user_config = _parse_user_config(config)
+    user_config = _parse_user_config_for_request(request, config)
     manifest_payload = build_manifest(_service_base_url(request), configured=bool(user_config), user_config=user_config)
     log_event(
         LOGGER,
@@ -1375,7 +1339,7 @@ def manifest_head(config: str | None = None) -> Response:
 def catalog(request: Request, catalog_id: str, extra: str | None = None, config: str | None = None) -> JSONResponse:
     catalog_def = _find_catalog(catalog_id)
     extra_props = _parse_extra(extra)
-    user_config = _parse_user_config(config)
+    user_config = _parse_user_config_for_request(request, config)
     search = extra_props.get("search") or None
     skip = _parse_skip(extra_props.get("skip"))
     country_filter = _effective_country_filter(catalog_def, user_config)
@@ -1429,7 +1393,7 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None, config:
 @app.get("/{config}/meta/tv/{meta_id:path}.json")
 def meta(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
-    user_config = _parse_user_config(config)
+    user_config = _parse_user_config_for_request(request, config)
     request_fields = _request_log_fields(request, meta_id=meta_id, user_config_hash=config_fingerprint(user_config))
     if kind == "channel":
         channel_id = value
@@ -1500,7 +1464,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
 @app.get("/{config}/stream/tv/{meta_id:path}.json")
 def stream(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
-    user_config = _parse_user_config(config)
+    user_config = _parse_user_config_for_request(request, config)
     request_fields = _request_log_fields(request, meta_id=meta_id, user_config_hash=config_fingerprint(user_config), kind=kind)
     log_event(LOGGER, logging.INFO, "stream_request_start", **request_fields)
     if kind == "channel":

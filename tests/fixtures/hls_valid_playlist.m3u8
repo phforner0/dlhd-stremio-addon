@@ -1,0 +1,9 @@
+#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:24667
+#EXT-X-KEY:METHOD=AES-128,IV=0x30303030303030303030303069df8bc5,URI="/key/premium81/5920860",KEYFORMAT="identity"
+#EXTINF:4.000,
+/redirect/media/cnxfeeconfessioncxv/static/eplayer_cc087fa7b0c2253b.js?subdomain=f006
+#EXTINF:4.000,
+/redirect/media/cnxsoligravelcxv/assets/eplayer_main.8e2f9080.js?subdomain=f003
