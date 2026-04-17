@@ -148,5 +148,6 @@ def test_hls_fixture_looks_like_playlist_and_extracts_targets() -> None:
 
 def test_provider_bootstrap_rules_reject_unrelated_iframe_hosts() -> None:
     assert should_attempt_bootstrap_fetch("https://enviromentalspa2.sbs/premiumtv/daddyhd.php?id=81") is True
+    assert should_attempt_bootstrap_fetch("https://domaintransver.cfd/premiumtv/daddyhd.php?id=81") is True
     assert should_attempt_bootstrap_fetch("https://viewembed.ru/channel/ESPNBrazil[Brazil]") is True
     assert should_attempt_bootstrap_fetch("https://ads.example.test/frame.html") is False

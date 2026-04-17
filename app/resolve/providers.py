@@ -48,12 +48,15 @@ class BootstrapStrategy:
     player_label_hints: tuple[str, ...] = ()
     required_markers: tuple[str, ...] = BOOTSTRAP_MARKERS
     fallback: bool = False
+    match_any_host: bool = False
 
     def matches_host(self, url: str) -> bool:
         parsed = urlparse(url)
         host = parsed.hostname
         if not host:
             return False
+        if self.match_any_host:
+            return True
         return any(_host_matches(host, pattern) for pattern in self.host_patterns)
 
     def matches_url(self, url: str) -> bool:
@@ -108,6 +111,8 @@ class BootstrapStrategy:
 
 
 PLAYER_PAGE_HOSTS: tuple[str, ...] = (
+    "dlstreams.com",
+    ".dlstreams.com",
     "dlstreams.top",
     ".dlstreams.top",
 )
@@ -123,6 +128,13 @@ SPECIFIC_BOOTSTRAP_STRATEGIES: tuple[BootstrapStrategy, ...] = (
         ),
         path_prefixes=("/premiumtv/",),
         player_path_hints=("/stream/", "/cast/"),
+    ),
+    BootstrapStrategy(
+        name="premiumtv-any-host",
+        host_patterns=(),
+        path_prefixes=("/premiumtv/",),
+        player_path_hints=("/stream/", "/cast/"),
+        match_any_host=True,
     ),
     BootstrapStrategy(
         name="topembed-channel",
@@ -161,7 +173,11 @@ def matching_bootstrap_strategies(
     if not source_url:
         return BOOTSTRAP_STRATEGIES
 
-    candidates = [strategy for strategy in BOOTSTRAP_STRATEGIES if strategy.matches_host(source_url)]
+    candidates = [
+        strategy
+        for strategy in BOOTSTRAP_STRATEGIES
+        if strategy.matches_url(source_url) or (not strategy.match_any_host and strategy.matches_host(source_url))
+    ]
     if not candidates:
         return ()
 

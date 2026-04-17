@@ -386,6 +386,70 @@ def _scan_html_for_manifests(html: str, base_url: str) -> list[str]:
     return found
 
 
+def _static_iframe_urls(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    found: list[str] = []
+    seen: set[str] = set()
+    for frame in soup.find_all("iframe"):
+        src = _abs((frame.get("src") or "").strip(), base_url)
+        if src and src not in seen:
+            seen.add(src)
+            found.append(src)
+    return found
+
+
+def _http_resolve_player_page(label: str, player_url: str) -> tuple[list[tuple[str, str]], list[str], str | None]:
+    try:
+        with build_session() as session:
+            response = guarded_get(
+                session,
+                player_url,
+                operation="resolver_http_fallback",
+                timeout=settings.HTTP_TIMEOUT_SECONDS,
+                headers=DEFAULT_HEADERS,
+            )
+            response.raise_for_status()
+            html = response.text
+            final_url = response.url or player_url
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "resolve_http_fallback_failed",
+            **_resolve_log_fields(label, player_url, reason=exc.__class__.__name__),
+        )
+        return [], [], None
+
+    hits = _hits(_scan_html_for_manifests(html, final_url), final_url)
+    iframe_urls = _static_iframe_urls(html, final_url)
+    iframe_hits: list[tuple[str, str]] = []
+    iframe_seen: set[str] = set()
+    for iframe_url in iframe_urls:
+        _append_unique_hits(
+            iframe_hits,
+            iframe_seen,
+            _hits(
+                _extract_embed_proxy_manifest_from_url(
+                    iframe_url,
+                    final_url,
+                    player_url=player_url,
+                    player_label=label,
+                ),
+                player_url,
+            ),
+        )
+
+    if hits or iframe_hits:
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "resolve_http_fallback_hit",
+            **_resolve_log_fields(label, player_url, manifest_count=len(hits) + len(iframe_hits), iframe_count=len(iframe_urls)),
+        )
+
+    return hits + iframe_hits, iframe_urls, final_url
+
+
 def _hits(values: Iterable[str], found_at_url: str) -> list[tuple[str, str]]:
     return [(value, found_at_url) for value in values]
 
@@ -790,6 +854,25 @@ class PlaywrightResolver:
 
         log_event(LOGGER, logging.INFO, "resolve_start", **_resolve_log_fields(label, player_url))
 
+        http_hits, static_iframes, http_final_url = _http_resolve_player_page(label, player_url)
+        if http_hits:
+            _append_unique_hits(network_hits, network_seen, http_hits)
+            for iframe_url in static_iframes:
+                if iframe_url not in iframe_seen_set:
+                    iframe_seen_set.add(iframe_url)
+                    iframes_seen.append(iframe_url)
+            result.player_final_url = http_final_url or player_url
+            _populate_manifest_results(
+                result=result,
+                network_hits=network_hits,
+                dom_hits=[],
+                js_hits=[],
+                iframe_hits=[],
+            )
+            result.iframes_seen = iframes_seen
+            _log_resolve_end()
+            return result
+
         self._semaphore.acquire()
         try:
             try:
@@ -928,7 +1011,7 @@ class PlaywrightResolver:
                     _append_unique_hits(
                         iframe_hits,
                         iframe_seen_manifest_set,
-                        _hits(_extract_embed_proxy_manifest_from_url(frame_url, page_url, player_url=player_url, player_label=label), frame_url),
+                        _hits(_extract_embed_proxy_manifest_from_url(frame_url, page_url, player_url=player_url, player_label=label), player_url),
                     )
 
                     if _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
@@ -942,7 +1025,7 @@ class PlaywrightResolver:
                         _append_unique_hits(
                             iframe_hits,
                             iframe_seen_manifest_set,
-                            _hits(_extract_embed_proxy_manifest_from_url(iframe_url, page_url, player_url=player_url, player_label=label), iframe_url),
+                            _hits(_extract_embed_proxy_manifest_from_url(iframe_url, page_url, player_url=player_url, player_label=label), player_url),
                         )
                         if _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
                             break
@@ -1015,7 +1098,7 @@ class PlaywrightResolver:
                             _append_unique_hits(
                                 iframe_hits,
                                 iframe_seen_manifest_set,
-                                _hits(_extract_embed_proxy_manifest_from_url(ext_final, page_url, player_url=player_url, player_label=label), ext_final),
+                                _hits(_extract_embed_proxy_manifest_from_url(ext_final, page_url, player_url=player_url, player_label=label), player_url),
                             )
 
                             if not _has_manifest_hits(iframe_hits):
@@ -1029,7 +1112,7 @@ class PlaywrightResolver:
                                     _append_unique_hits(
                                         iframe_hits,
                                         iframe_seen_manifest_set,
-                                        _hits(_extract_embed_proxy_manifest_from_url(sub_url, page_url, player_url=player_url, player_label=label), sub_url),
+                                        _hits(_extract_embed_proxy_manifest_from_url(sub_url, page_url, player_url=player_url, player_label=label), player_url),
                                     )
 
                                     if _has_manifest_hits(iframe_hits):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app import settings
-from app.resolve.player import _extract_embed_proxy_manifest_from_url, _new_wait_state, _should_ignore_https_errors, _wait_for_resolution_window
+from app.resolve.player import _extract_embed_proxy_manifest_from_url, _http_resolve_player_page, _new_wait_state, _should_ignore_https_errors, _wait_for_resolution_window
 
 
 class _FakeResponse:
@@ -25,6 +25,15 @@ class _FakeSession:
 
     def get(self, url: str, timeout: int):
         return _FakeResponse(self._text)
+
+
+class _FakeHttpResponse:
+    def __init__(self, url: str, text: str) -> None:
+        self.url = url
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        return None
 
 
 class _FakePage:
@@ -108,3 +117,30 @@ def test_wait_for_resolution_window_does_not_exit_early_for_frame_only_signal(mo
     _wait_for_resolution_window(page, state, 10000)
 
     assert now[0] >= 5.0
+
+
+def test_http_resolve_player_page_extracts_static_iframe_bootstrap(monkeypatch) -> None:
+    html = '<html><body><iframe src="https://domaintransver.cfd/premiumtv/daddyhd.php?id=81"></iframe></body></html>'
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("app.resolve.player.build_session", lambda: FakeSession())
+    monkeypatch.setattr(
+        "app.resolve.player.guarded_get",
+        lambda session, url, operation, timeout, headers: _FakeHttpResponse(url, html),
+    )
+    monkeypatch.setattr(
+        "app.resolve.player._extract_embed_proxy_manifest_from_url",
+        lambda url, referer, timeout=10, player_url=None, player_label=None: ["https://example.test/proxy/premium81/mono.css"],
+    )
+
+    hits, iframe_urls, final_url = _http_resolve_player_page("Player 1", "https://dlstreams.com/stream/stream-81.php")
+
+    assert iframe_urls == ["https://domaintransver.cfd/premiumtv/daddyhd.php?id=81"]
+    assert hits == [("https://example.test/proxy/premium81/mono.css", "https://dlstreams.com/stream/stream-81.php")]
+    assert final_url == "https://dlstreams.com/stream/stream-81.php"
