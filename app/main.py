@@ -1226,7 +1226,8 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
 
         streams: list[dict] = []
         seen_urls: set[str] = set()
-        for label, player_url in targets[:settings.CHANNEL_STREAM_MAX_ATTEMPTS]:
+        # Keep the `/watch/` variant in play even under conservative deploy limits.
+        for label, player_url in targets[: max(settings.CHANNEL_STREAM_MAX_ATTEMPTS, 3)]:
             log_event(
                 LOGGER,
                 logging.DEBUG,

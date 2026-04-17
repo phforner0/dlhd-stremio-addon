@@ -1,0 +1,104 @@
+Run python - <<'PY'
+  python - <<'PY'
+  import json
+  import os
+  import urllib.error
+  import urllib.parse
+  import urllib.request
+  
+  base = os.environ["ADDON_BASE_URL"].rstrip("/")
+  configured_ids = [item.strip() for item in os.environ.get("SMOKE_CHANNEL_IDS", "").split(",") if item.strip()]
+  
+  def get_json(url: str, label: str) -> dict:
+      print(f"GET {label}: {url}")
+      try:
+          with urllib.request.urlopen(url, timeout=90) as resp:
+              return json.load(resp)
+      except Exception as exc:
+          print(f"Failed endpoint {label}: {url}")
+          raise AssertionError(f"deployed smoke failed at {label}: {url}") from exc
+  
+  def expect_status(url: str, label: str, status_code: int) -> None:
+      print(f"EXPECT {status_code} {label}: {url}")
+      try:
+          urllib.request.urlopen(url, timeout=90)
+      except urllib.error.HTTPError as exc:
+          assert exc.code == status_code
+          return
+      raise AssertionError(f"expected HTTP {status_code} at {label}: {url}")
+  
+  health = get_json(base + "/healthz", "/healthz")
+  assert health["ok"] is True
+  
+  manifest = get_json(base + "/manifest.json", "/manifest.json")
+  assert manifest["catalogs"]
+  
+  invalid_manifest = get_json(base + "/cfg-not-a-real-token/manifest.json", "/cfg-not-a-real-token/manifest.json")
+  assert invalid_manifest["version"] == manifest["version"]
+  assert invalid_manifest["behaviorHints"]["configurable"] is True
+  
+  blocked_query = urllib.parse.urlencode({
+      "url": "https://example.com/evil.m3u8",
+      "referer": "https://embedkclx.sbs/premiumtv/daddyhd.php?id=81",
+  })
+  expect_status(base + f"/proxy/stream.m3u8?{blocked_query}", "/proxy blocked host", 403)
+  
+  channels = get_json(base + "/catalog/tv/channels_br.json", "/catalog/tv/channels_br.json")
+  assert channels["metas"]
+  
+  catalog_candidate_ids = [meta["id"].split(":")[-1] for meta in channels["metas"][:20]]
+  candidate_ids = configured_ids + [channel_id for channel_id in catalog_candidate_ids if channel_id not in configured_ids]
+  print(f"Smoke candidate ids: {candidate_ids}")
+  matched = None
+  tried = []
+  for channel_id in candidate_ids:
+      tried.append(channel_id)
+      meta = get_json(base + f"/meta/tv/dlhd:ch:{channel_id}.json", f"/meta/tv/dlhd:ch:{channel_id}.json")
+      assert meta["meta"]["videos"]
+      stream = get_json(base + f"/stream/tv/dlhd:ch:{channel_id}.json", f"/stream/tv/dlhd:ch:{channel_id}.json")
+      if stream["streams"]:
+          matched = (channel_id, stream)
+          print(f"Selected smoke channel id: {channel_id}")
+          break
+  
+  if matched is None:
+      print(f"No playable deployed smoke channel found. Tried: {tried}")
+  assert matched is not None, "no playable deployed channel found in smoke set"
+  PY
+  shell: /usr/bin/bash -e {0}
+  env:
+    ADDON_BASE_URL: https://dlhd-stremio-addon-production.up.railway.app
+    SMOKE_CHANNEL_IDS: 81
+GET /healthz: https://dlhd-stremio-addon-production.up.railway.app/healthz
+GET /manifest.json: https://dlhd-stremio-addon-production.up.railway.app/manifest.json
+GET /cfg-not-a-real-token/manifest.json: https://dlhd-stremio-addon-production.up.railway.app/cfg-not-a-real-token/manifest.json
+EXPECT 403 /proxy blocked host: https://dlhd-stremio-addon-production.up.railway.app/proxy/stream.m3u8?url=https%3A%2F%2Fexample.com%2Fevil.m3u8&referer=https%3A%2F%2Fembedkclx.sbs%2Fpremiumtv%2Fdaddyhd.php%3Fid%3D81
+GET /catalog/tv/channels_br.json: https://dlhd-stremio-addon-production.up.railway.app/catalog/tv/channels_br.json
+Smoke candidate ids: ['81', '275', '89', '82', '83', '85', '88', '78', '79', '80', '87']
+GET /meta/tv/dlhd:ch:81.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:81.json
+GET /stream/tv/dlhd:ch:81.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:81.json
+GET /meta/tv/dlhd:ch:275.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:275.json
+GET /stream/tv/dlhd:ch:275.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:275.json
+GET /meta/tv/dlhd:ch:89.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:89.json
+GET /stream/tv/dlhd:ch:89.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:89.json
+GET /meta/tv/dlhd:ch:82.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:82.json
+GET /stream/tv/dlhd:ch:82.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:82.json
+GET /meta/tv/dlhd:ch:83.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:83.json
+GET /stream/tv/dlhd:ch:83.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:83.json
+GET /meta/tv/dlhd:ch:85.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:85.json
+GET /stream/tv/dlhd:ch:85.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:85.json
+GET /meta/tv/dlhd:ch:88.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:88.json
+GET /stream/tv/dlhd:ch:88.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:88.json
+GET /meta/tv/dlhd:ch:78.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:78.json
+GET /stream/tv/dlhd:ch:78.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:78.json
+GET /meta/tv/dlhd:ch:79.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:79.json
+GET /stream/tv/dlhd:ch:79.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:79.json
+GET /meta/tv/dlhd:ch:80.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:80.json
+GET /stream/tv/dlhd:ch:80.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:80.json
+GET /meta/tv/dlhd:ch:87.json: https://dlhd-stremio-addon-production.up.railway.app/meta/tv/dlhd:ch:87.json
+GET /stream/tv/dlhd:ch:87.json: https://dlhd-stremio-addon-production.up.railway.app/stream/tv/dlhd:ch:87.json
+No playable deployed smoke channel found. Tried: ['81', '275', '89', '82', '83', '85', '88', '78', '79', '80', '87']
+Traceback (most recent call last):
+  File "<stdin>", line 64, in <module>
+AssertionError: no playable deployed channel found in smoke set
+Error: Process completed with exit code 1.

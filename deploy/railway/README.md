@@ -37,6 +37,7 @@ DLHD_PLAYWRIGHT_MAX_CONCURRENCY=1
 DLHD_LIVE_STREAM_MAX_WORKERS=1
 DLHD_LIVE_STREAM_MAX_RESULTS=4
 DLHD_LIVE_STREAM_MAX_ATTEMPTS=2
+DLHD_CHANNEL_STREAM_MAX_ATTEMPTS=3
 DLHD_CHANNELS_CACHE_TTL=43200
 DLHD_SCHEDULE_CACHE_TTL=120
 DLHD_WATCH_CACHE_TTL=1800
@@ -96,6 +97,7 @@ After deploy, validate at least these flows:
 
 - If deploy fails immediately, confirm the root directory is correct.
 - If the service starts but URLs are wrong, confirm Railway is forwarding standard proxy headers.
+- If `/stream` keeps returning empty arrays, set `DLHD_CHANNEL_STREAM_MAX_ATTEMPTS=3` or higher and restart the service.
 - If stream requests are too slow, reduce:
   - `DLHD_LIVE_STREAM_MAX_RESULTS`
   - `DLHD_LIVE_STREAM_MAX_ATTEMPTS`
