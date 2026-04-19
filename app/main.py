@@ -1902,7 +1902,7 @@ def proxy_media(
         if header_value:
             response_headers[header_name] = header_value
 
-    if content_type in {"application/javascript", "text/javascript", "text/plain", "text/txt"}:
+    if content_type in {"application/javascript", "text/javascript", "text/plain", "text/txt", "text/css"}:
         content_type = "application/octet-stream"
 
     log_event(

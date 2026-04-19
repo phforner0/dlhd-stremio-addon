@@ -181,6 +181,32 @@ def test_proxy_passes_range_header(monkeypatch) -> None:
     assert session.calls[0][1]["Range"] == "bytes=0-3"
 
 
+def test_proxy_normalizes_css_media_segments_to_octet_stream(monkeypatch) -> None:
+    client = TestClient(app)
+    session = FakeSession(
+        {
+            "https://img.aiphotofree.site/static/segment.css": FakeResponse(
+                "https://img.aiphotofree.site/static/segment.css",
+                headers={"Content-Type": "text/css"},
+                content=b"\xa5\x00\x01",
+            )
+        }
+    )
+    monkeypatch.setattr("app.main.get_pooled_session", lambda: session)
+    monkeypatch.setattr("app.main._public_host", lambda host: True)
+
+    response = client.get(
+        "/proxy/segment.css",
+        params={
+            "url": "https://img.aiphotofree.site/static/segment.css",
+            "referer": "https://dlstreams.com/stream/stream-81.php",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+
+
 def test_proxy_returns_503_when_upstream_circuit_is_open(monkeypatch) -> None:
     client = TestClient(app)
     monkeypatch.setattr("app.main.guarded_get", lambda *args, **kwargs: (_ for _ in ()).throw(UpstreamCircuitOpen("vid.aivideox.site", "proxy_upstream")))
