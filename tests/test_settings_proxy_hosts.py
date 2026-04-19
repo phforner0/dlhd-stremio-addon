@@ -13,6 +13,7 @@ def test_proxy_allowed_hosts_merge_defaults_with_legacy_env_list() -> None:
     assert ".enviromentalspa2.sbs" in hosts
     assert "viewembed.ru" in hosts
     assert "soyspace.cyou" in hosts
+    assert ".aiphotofree.site" in hosts
 
 
 def test_proxy_allowed_hosts_strict_mode_keeps_only_explicit_hosts() -> None:

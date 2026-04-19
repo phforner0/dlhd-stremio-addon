@@ -161,6 +161,8 @@ BOOTSTRAP_MANIFEST_HOSTS: tuple[str, ...] = (
     ".soyspace.cyou",
     "vid.aivideox.site",
     ".aivideox.site",
+    "aiphotofree.site",
+    ".aiphotofree.site",
 )
 
 

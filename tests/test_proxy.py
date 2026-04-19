@@ -56,6 +56,7 @@ def test_proxy_allowlist_includes_new_embed_hosts() -> None:
     assert _host_allowed("chevy.enviromentalspa2.sbs") is True
     assert _host_allowed("viewembed.ru") is True
     assert _host_allowed("chevy.soyspace.cyou") is True
+    assert _host_allowed("img.aiphotofree.site") is True
 
 
 def test_proxy_rejects_private_ip(monkeypatch) -> None:
