@@ -157,6 +157,8 @@ BOOTSTRAP_STRATEGIES: tuple[BootstrapStrategy, ...] = (
 )
 
 BOOTSTRAP_MANIFEST_HOSTS: tuple[str, ...] = (
+    "vovlacosa.sbs",
+    ".vovlacosa.sbs",
     "soyspace.cyou",
     ".soyspace.cyou",
     "vid.aivideox.site",
