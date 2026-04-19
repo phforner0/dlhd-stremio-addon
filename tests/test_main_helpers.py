@@ -6,6 +6,7 @@ from starlette.requests import Request
 from app import settings
 from app.main import (
     _build_channel_streams,
+    _channel_player_cache_key,
     _encode_user_config,
     _effective_country_filter,
     _event_display_values,
@@ -14,6 +15,7 @@ from app.main import (
     _ordered_live_channels,
     _parse_user_config,
     _resolve_live_channel_stream,
+    channel_player_cache,
     live_channel_stream_cache,
     stream_cache,
 )
@@ -362,7 +364,7 @@ def test_build_channel_streams_keeps_third_player_available_under_low_attempt_li
     )
     monkeypatch.setattr(settings, "CHANNEL_STREAM_MAX_ATTEMPTS", 2)
 
-    cache_key = f"stream:channel:{channel.channel_id}:http://127.0.0.1:7000"
+    cache_key = f"stream:channel:{channel.channel_id}:http://127.0.0.1:7000:default"
     stream_cache.delete(cache_key)
 
     streams = _build_channel_streams(channel, request, {})
@@ -370,3 +372,151 @@ def test_build_channel_streams_keeps_third_player_available_under_low_attempt_li
     assert len(streams) == 1
     assert streams[0]["description"].endswith("Player 3 | HLS")
     stream_cache.delete(cache_key)
+
+
+def test_build_channel_streams_falls_back_to_remaining_players_after_initial_batch(monkeypatch) -> None:
+    channel = CatalogChannel(
+        channel_id=81,
+        name="ESPN Brasil",
+        watch_url="https://example.test/watch.php?id=81",
+        search_hint=None,
+        group_letter=None,
+        country_code="br",
+        country_label="Brazil",
+    )
+    wrapper = WrapperCatalog(
+        source=SourceInfo(input=channel.watch_url, type="url"),
+        channel=ChannelInfo(id=81, name="ESPN Brasil", heading="ESPN Brasil"),
+        page=PageInfo(title="ESPN Brasil", description="Sports", canonicalUrl=channel.watch_url, poster=None),
+        player=PlayerInfo(
+            primary=PrimaryPlayer(label="primary", url="https://example.test/player-1"),
+            alternates=[
+                AlternatePlayer(label="Player 1", url="https://example.test/player-1", active=True),
+                AlternatePlayer(label="Player 2", url="https://example.test/player-2", active=False),
+                AlternatePlayer(label="Player 3", url="https://example.test/player-3", active=False),
+                AlternatePlayer(label="Player 4", url="https://example.test/player-4", active=False),
+            ],
+        ),
+        related=RelatedInfo(label=None),
+    )
+    resolutions = {
+        player_url: PlayerResolution(label=label, player_page_url=player_url, manifests=[])
+        for label, player_url in (
+            ("Player 1", "https://example.test/player-1"),
+            ("Player 2", "https://example.test/player-2"),
+            ("Player 3", "https://example.test/player-3"),
+        )
+    }
+    resolutions["https://example.test/player-4"] = PlayerResolution(
+        label="Player 4",
+        player_page_url="https://example.test/player-4",
+        manifests=[
+            ManifestResult(
+                url="https://example.test/player-4.m3u8",
+                player_type="hls",
+                found_at_url="https://example.test/player-4",
+                source="network",
+            )
+        ],
+    )
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "server": ("127.0.0.1", 7000),
+            "client": ("127.0.0.1", 12345),
+            "path": "/",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    monkeypatch.setattr("app.main.get_wrapper", lambda channel_id: wrapper)
+    monkeypatch.setattr("app.main.resolver.resolve_player", lambda label, player_url: resolutions[player_url])
+    monkeypatch.setattr("app.main._valid_hls_stream", lambda manifest_url, referer: True)
+    monkeypatch.setattr(settings, "CHANNEL_STREAM_MAX_ATTEMPTS", 2)
+
+    cache_key = f"stream:channel:{channel.channel_id}:http://127.0.0.1:7000"
+    stream_cache.delete(cache_key)
+    channel_player_cache.delete(_channel_player_cache_key(channel.channel_id))
+
+    streams = _build_channel_streams(channel, request, {})
+
+    assert len(streams) == 1
+    assert streams[0]["description"].endswith("Player 4 | HLS")
+    assert channel_player_cache.get(_channel_player_cache_key(channel.channel_id)) == "https://example.test/player-4"
+    stream_cache.delete(cache_key)
+    channel_player_cache.delete(_channel_player_cache_key(channel.channel_id))
+
+
+def test_build_channel_streams_prefers_last_successful_player(monkeypatch) -> None:
+    channel = CatalogChannel(
+        channel_id=81,
+        name="ESPN Brasil",
+        watch_url="https://example.test/watch.php?id=81",
+        search_hint=None,
+        group_letter=None,
+        country_code="br",
+        country_label="Brazil",
+    )
+    wrapper = WrapperCatalog(
+        source=SourceInfo(input=channel.watch_url, type="url"),
+        channel=ChannelInfo(id=81, name="ESPN Brasil", heading="ESPN Brasil"),
+        page=PageInfo(title="ESPN Brasil", description="Sports", canonicalUrl=channel.watch_url, poster=None),
+        player=PlayerInfo(
+            primary=PrimaryPlayer(label="primary", url="https://example.test/player-1"),
+            alternates=[
+                AlternatePlayer(label="Player 1", url="https://example.test/player-1", active=True),
+                AlternatePlayer(label="Player 2", url="https://example.test/player-2", active=False),
+            ],
+        ),
+        related=RelatedInfo(label=None),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "server": ("127.0.0.1", 7000),
+            "client": ("127.0.0.1", 12345),
+            "path": "/",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+    call_order: list[str] = []
+    resolutions = {
+        "https://example.test/player-1": PlayerResolution(label="Player 1", player_page_url="https://example.test/player-1", manifests=[]),
+        "https://example.test/player-2": PlayerResolution(
+            label="Player 2",
+            player_page_url="https://example.test/player-2",
+            manifests=[
+                ManifestResult(
+                    url="https://example.test/player-2.m3u8",
+                    player_type="hls",
+                    found_at_url="https://example.test/player-2",
+                    source="network",
+                )
+            ],
+        ),
+    }
+
+    def resolve_player(label, player_url):
+        call_order.append(player_url)
+        return resolutions[player_url]
+
+    monkeypatch.setattr("app.main.get_wrapper", lambda channel_id: wrapper)
+    monkeypatch.setattr("app.main.resolver.resolve_player", resolve_player)
+    monkeypatch.setattr("app.main._valid_hls_stream", lambda manifest_url, referer: True)
+    channel_player_cache.set(_channel_player_cache_key(channel.channel_id), "https://example.test/player-2", 60)
+
+    cache_key = f"stream:channel:{channel.channel_id}:http://127.0.0.1:7000:{'channelStreamResults=1'}"
+    stream_cache.delete(cache_key)
+
+    streams = _build_channel_streams(channel, request, {"channelStreamResults": "1"})
+
+    assert len(streams) == 1
+    assert call_order[0] == "https://example.test/player-2"
+    stream_cache.delete(cache_key)
+    channel_player_cache.delete(_channel_player_cache_key(channel.channel_id))

@@ -87,6 +87,7 @@ schedule_index_cache: TTLCache[dict[str, LiveEvent]] = TTLCache(
 )
 watch_cache: TTLCache[WrapperCatalog] = TTLCache(max_entries=settings.WATCH_CACHE_MAX_ENTRIES, name="watch")
 stream_cache: TTLCache[list[dict]] = TTLCache(max_entries=settings.STREAM_CACHE_MAX_ENTRIES, name="stream")
+channel_player_cache: TTLCache[str] = TTLCache(max_entries=settings.WATCH_CACHE_MAX_ENTRIES, name="channel_player")
 live_channel_stream_cache: TTLCache[dict[str, str]] = TTLCache(
     max_entries=settings.LIVE_CHANNEL_CACHE_MAX_ENTRIES,
     name="live_channel",
@@ -968,6 +969,34 @@ def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
     return targets
 
 
+def _channel_player_cache_key(channel_id: int) -> str:
+    return f"channel-player:{channel_id}"
+
+
+def _prioritized_channel_player_targets(channel: CatalogChannel, wrapper: WrapperCatalog) -> list[tuple[str, str]]:
+    targets = _ordered_player_targets(wrapper)
+    preferred_url = channel_player_cache.get(_channel_player_cache_key(channel.channel_id))
+    if not preferred_url:
+        return targets
+
+    preferred: list[tuple[str, str]] = []
+    remaining: list[tuple[str, str]] = []
+    for target in targets:
+        if target[1] == preferred_url:
+            preferred.append(target)
+        else:
+            remaining.append(target)
+    return preferred + remaining
+
+
+def _remember_channel_player(channel_id: int, player_url: str) -> None:
+    channel_player_cache.set(
+        _channel_player_cache_key(channel_id),
+        player_url,
+        settings.WATCH_CACHE_TTL_SECONDS,
+    )
+
+
 def _ordered_live_channels(event: LiveEvent, config: dict[str, str]) -> list:
     unique_channels = list({channel.channel_id: channel for channel in event.channels}.values())
     configured_country = _preferred_country_code(config)
@@ -1222,97 +1251,115 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
             )
             return []
 
-        targets = _ordered_player_targets(wrapper)
+        targets = _prioritized_channel_player_targets(channel, wrapper)
+        initial_attempt_limit = min(len(targets), max(settings.CHANNEL_STREAM_MAX_ATTEMPTS, 3))
+        target_batches = [targets[:initial_attempt_limit]]
+        if initial_attempt_limit < len(targets):
+            target_batches.append(targets[initial_attempt_limit:])
 
         streams: list[dict] = []
         seen_urls: set[str] = set()
-        # Keep the `/watch/` variant in play even under conservative deploy limits.
-        for label, player_url in targets[: max(settings.CHANNEL_STREAM_MAX_ATTEMPTS, 3)]:
-            log_event(
-                LOGGER,
-                logging.DEBUG,
-                "channel_player_attempt",
-                channel_id=channel.channel_id,
-                provider=label,
-                player_host=urlparse(player_url).hostname,
-            )
-            try:
-                resolution = resolver.resolve_player(label, player_url)
-            except Exception as exc:  # noqa: BLE001
+        for batch_index, batch in enumerate(target_batches, start=1):
+            if batch_index > 1:
                 log_event(
                     LOGGER,
-                    logging.WARNING,
-                    "stream_candidate_rejected",
+                    logging.INFO,
+                    "channel_player_fallback_scan",
                     channel_id=channel.channel_id,
-                    provider=label,
-                    reason="resolver_exception",
-                    error=exc.__class__.__name__,
-                    player_host=urlparse(player_url).hostname,
+                    attempted_players=initial_attempt_limit,
+                    remaining_players=len(batch),
                 )
-                continue
 
-            if not resolution.manifests:
+            for label, player_url in batch:
                 log_event(
                     LOGGER,
                     logging.DEBUG,
-                    "stream_candidate_rejected",
+                    "channel_player_attempt",
                     channel_id=channel.channel_id,
-                    provider=resolution.label,
-                    reason="no_manifests",
+                    provider=label,
                     player_host=urlparse(player_url).hostname,
                 )
+                try:
+                    resolution = resolver.resolve_player(label, player_url)
+                except Exception as exc:  # noqa: BLE001
+                    log_event(
+                        LOGGER,
+                        logging.WARNING,
+                        "stream_candidate_rejected",
+                        channel_id=channel.channel_id,
+                        provider=label,
+                        reason="resolver_exception",
+                        error=exc.__class__.__name__,
+                        player_host=urlparse(player_url).hostname,
+                    )
+                    continue
 
-            for manifest in resolution.manifests:
-                if manifest.url in seen_urls:
+                if not resolution.manifests:
                     log_event(
                         LOGGER,
                         logging.DEBUG,
                         "stream_candidate_rejected",
                         channel_id=channel.channel_id,
                         provider=resolution.label,
-                        reason="duplicate_manifest",
-                        stream_kind=manifest.player_type,
-                        **proxy_url_fields(manifest.url),
+                        reason="no_manifests",
+                        player_host=urlparse(player_url).hostname,
                     )
-                    continue
-                if manifest.player_type.lower() == "hls" and not _valid_hls_stream(manifest.url, manifest.found_at_url):
+
+                player_selected = False
+                for manifest in resolution.manifests:
+                    if manifest.url in seen_urls:
+                        log_event(
+                            LOGGER,
+                            logging.DEBUG,
+                            "stream_candidate_rejected",
+                            channel_id=channel.channel_id,
+                            provider=resolution.label,
+                            reason="duplicate_manifest",
+                            stream_kind=manifest.player_type,
+                            **proxy_url_fields(manifest.url),
+                        )
+                        continue
+                    if manifest.player_type.lower() == "hls" and not _valid_hls_stream(manifest.url, manifest.found_at_url):
+                        log_event(
+                            LOGGER,
+                            logging.WARNING,
+                            "stream_candidate_rejected",
+                            channel_id=channel.channel_id,
+                            provider=resolution.label,
+                            reason="invalid_hls_manifest",
+                            hls_reason=_hls_validation_reason(manifest.url, manifest.found_at_url),
+                            stream_kind=manifest.player_type,
+                            **proxy_url_fields(manifest.url),
+                        )
+                        continue
+                    seen_urls.add(manifest.url)
+                    if not player_selected:
+                        _remember_channel_player(channel.channel_id, player_url)
+                        player_selected = True
                     log_event(
                         LOGGER,
-                        logging.WARNING,
-                        "stream_candidate_rejected",
+                        logging.INFO,
+                        "stream_candidate_selected",
                         channel_id=channel.channel_id,
                         provider=resolution.label,
-                        reason="invalid_hls_manifest",
-                        hls_reason=_hls_validation_reason(manifest.url, manifest.found_at_url),
                         stream_kind=manifest.player_type,
                         **proxy_url_fields(manifest.url),
                     )
-                    continue
-                seen_urls.add(manifest.url)
-                log_event(
-                    LOGGER,
-                    logging.INFO,
-                    "stream_candidate_selected",
-                    channel_id=channel.channel_id,
-                    provider=resolution.label,
-                    stream_kind=manifest.player_type,
-                    **proxy_url_fields(manifest.url),
-                )
-                streams.append(
-                    _manifest_to_stream(
-                        request=request,
-                        display_name=settings.ADDON_NAME,
-                        description=(
-                            f"{channel.name} | {channel.country_label} | "
-                            f"{resolution.label} | {manifest.player_type.upper()}"
-                        ),
-                        manifest_url=manifest.url,
-                        referer=manifest.found_at_url,
-                        player_type=manifest.player_type,
+                    streams.append(
+                        _manifest_to_stream(
+                            request=request,
+                            display_name=settings.ADDON_NAME,
+                            description=(
+                                f"{channel.name} | {channel.country_label} | "
+                                f"{resolution.label} | {manifest.player_type.upper()}"
+                            ),
+                            manifest_url=manifest.url,
+                            referer=manifest.found_at_url,
+                            player_type=manifest.player_type,
+                        )
                     )
-                )
-                if len(streams) >= _channel_stream_result_limit(config):
-                    return streams
+                    if len(streams) >= _channel_stream_result_limit(config):
+                        return streams
 
             if streams:
                 _log_timing("channel stream resolve", started_at, channel_id=channel.channel_id, streams=len(streams))
