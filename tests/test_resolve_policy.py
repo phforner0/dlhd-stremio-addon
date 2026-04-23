@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app import settings
-from app.resolve.player import _extract_embed_proxy_manifest_from_url, _http_resolve_player_page, _new_wait_state, _should_ignore_https_errors, _wait_for_resolution_window
+from app.resolve.player import _extract_embed_proxy_manifest_from_url, _http_resolve_player_page, _new_wait_state, _scan_text, _should_ignore_https_errors, _wait_for_resolution_window
 
 
 class _FakeResponse:
@@ -81,6 +81,7 @@ def test_extract_embed_proxy_manifest_from_url_accepts_new_iframe_hosts(monkeypa
         "app.resolve.player._extract_embed_proxy_manifest_with_source",
         lambda html, timeout=10, source_url=None, player_url=None, player_label=None: ["https://example.test/proxy/premium81/mono.css"],
     )
+    monkeypatch.setattr("app.resolve.player.public_host", lambda host: True)
 
     manifests = _extract_embed_proxy_manifest_from_url(
         "https://enviromentalspa2.sbs/premiumtv/daddyhd.php?id=81",
@@ -99,6 +100,7 @@ def test_extract_embed_proxy_manifest_from_url_accepts_non_premiumtv_paths(monke
         "app.resolve.player._extract_embed_proxy_manifest_with_source",
         lambda html, timeout=10, source_url=None, player_url=None, player_label=None: ["https://example.test/proxy/espnbrazil/mono.css"],
     )
+    monkeypatch.setattr("app.resolve.player.public_host", lambda host: True)
 
     manifests = _extract_embed_proxy_manifest_from_url(
         "https://viewembed.ru/channel/ESPNBrazil[Brazil]",
@@ -106,6 +108,25 @@ def test_extract_embed_proxy_manifest_from_url_accepts_non_premiumtv_paths(monke
     )
 
     assert manifests == ["https://example.test/proxy/espnbrazil/mono.css"]
+
+
+def test_extract_embed_proxy_manifest_from_url_rejects_private_hosts(monkeypatch) -> None:
+    class FailingSession:
+        def __enter__(self):
+            raise AssertionError("network should not be reached")
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("app.resolve.player.build_session", lambda: FailingSession())
+    monkeypatch.setattr("app.resolve.player.public_host", lambda host: False)
+
+    manifests = _extract_embed_proxy_manifest_from_url(
+        "https://169.254.169.254/premiumtv/daddyhd.php?id=81",
+        "https://dlstreams.top/stream/stream-81.php",
+    )
+
+    assert manifests == []
 
 
 def test_wait_for_resolution_window_does_not_exit_early_for_frame_only_signal(monkeypatch) -> None:
@@ -144,3 +165,10 @@ def test_http_resolve_player_page_extracts_static_iframe_bootstrap(monkeypatch) 
     assert iframe_urls == ["https://domaintransver.cfd/premiumtv/daddyhd.php?id=81"]
     assert hits == [("https://example.test/proxy/premium81/mono.css", "https://dlstreams.com/stream/stream-81.php")]
     assert final_url == "https://dlstreams.com/stream/stream-81.php"
+
+
+def test_scan_text_accepts_escaped_and_protocol_relative_manifests() -> None:
+    hits = _scan_text(r'file:"https:\/\/cdn.example.test\/live\/index.m3u8" src="//cdn.example.test/live/backup.m3u8"')
+
+    assert "https://cdn.example.test/live/index.m3u8" in hits
+    assert "https://cdn.example.test/live/backup.m3u8" in hits

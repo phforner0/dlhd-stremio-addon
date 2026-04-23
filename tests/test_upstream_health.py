@@ -34,3 +34,18 @@ def test_upstream_health_success_clears_circuit(monkeypatch) -> None:
 
     health.before_request("example.test", operation="watch_fetch")
     assert health.degraded_host_count() == 0
+
+
+def test_upstream_health_resets_failure_count_after_window(monkeypatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr("app.upstream_health.time.monotonic", lambda: now[0])
+    health = UpstreamHealth(failure_threshold=3, failure_window_seconds=60, cooldown_seconds=30, max_hosts=16)
+
+    health.record_failure("example.test", operation="proxy", reason="Timeout")
+    now[0] += 50
+    health.record_failure("example.test", operation="proxy", reason="Timeout")
+    now[0] += 50
+    health.record_failure("example.test", operation="proxy", reason="Timeout")
+
+    health.before_request("example.test", operation="proxy")
+    assert health.degraded_host_count() == 0

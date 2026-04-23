@@ -33,7 +33,7 @@ playwright install chromium
 2. Start the service:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 7000
+python -m uvicorn app.main:app --host 0.0.0.0 --port 7000 --proxy-headers --forwarded-allow-ips='*'
 ```
 
 3. Install in Stremio with:
@@ -288,6 +288,12 @@ The service exposes a few environment variables for tuning live stream resolutio
   Caches the first successful live-channel resolution payload so later live events can reuse it. Default: `120`
 - `DLHD_HLS_PLAYLIST_CACHE_TTL`
   Caches rewritten HLS playlists to reduce repeated proxy work. Default: `15`
+- `DLHD_HLS_PLAYLIST_MAX_BYTES`
+  Rejects oversized upstream HLS playlists before rewrite/validation. Default: `1048576`
+- `DLHD_ARTWORK_IMAGE_MAX_BYTES`
+  Rejects oversized remote artwork images before caching. Default: `5242880`
+- `DLHD_PROXY_MEDIA_REDIRECT_ALLOWED_HOSTS`
+  Additional allowlist for `/redirect/media/` chains that legitimately hop to media CDN hosts.
 - `DLHD_HTTP_POOL_CONNECTIONS`
   HTTP connection pool size baseline for upstream proxy requests. Default: `32`
 - `DLHD_HTTP_POOL_MAXSIZE`
@@ -323,7 +329,9 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_ARTWORK_CACHE_MAX_ENTRIES`: artwork metadata cache size. Default: `512`
 - `DLHD_ARTWORK_IMAGE_CACHE_TTL`: remote image binary cache TTL. Default: `21600`
 - `DLHD_ARTWORK_IMAGE_CACHE_MAX_ENTRIES`: remote image binary cache size. Default: `256`
+- `DLHD_ARTWORK_IMAGE_MAX_BYTES`: max remote artwork image bytes before rejection. Default: `5242880`
 - `DLHD_PROXY_MAX_REDIRECTS`: max upstream redirects followed by `/proxy`. Default: `5`
+- `DLHD_PROXY_MEDIA_REDIRECT_ALLOWED_HOSTS`: extra host allowlist for trusted `/redirect/media/` CDN hops.
 - `DLHD_HTTP_POOL_CONNECTIONS`: pooled upstream HTTP connection count. Default: `32`
 - `DLHD_HTTP_POOL_MAXSIZE`: pooled upstream HTTP max size. Default: `64`
 - `DLHD_SAFE_HTTP_RETRY_TOTAL`: retry count for idempotent scrape/bootstrap requests. Default: `2`
@@ -351,6 +359,7 @@ You can override these in `.env` or your deployment platform:
 - `DLHD_STREAM_CACHE_TTL`: event/channel stream response cache TTL. Default: `120`
 - `DLHD_LIVE_CHANNEL_CACHE_TTL`: per-channel live resolution cache TTL. Default: `120`
 - `DLHD_HLS_PLAYLIST_CACHE_TTL`: rewritten HLS playlist cache TTL. Default: `15`
+- `DLHD_HLS_PLAYLIST_MAX_BYTES`: max HLS playlist bytes before rejection. Default: `1048576`
 - `DLHD_FAILED_STREAM_CACHE_TTL`: currently used for local tuning only. Default: `30`
 - `DLHD_UPSTREAM_FAILURE_THRESHOLD`: failures per host before opening a short cooldown. Default: `3`
 - `DLHD_UPSTREAM_FAILURE_WINDOW_SECONDS`: rolling failure window for the breaker. Default: `90`

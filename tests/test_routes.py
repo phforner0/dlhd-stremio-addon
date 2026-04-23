@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from urllib.parse import quote
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -30,6 +33,23 @@ def test_catalog_negative_skip_clamps_to_zero(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert calls["skip"] == 0
+
+
+def test_catalog_search_decodes_plus_as_space(monkeypatch) -> None:
+    client = TestClient(app)
+    calls: dict[str, object] = {}
+
+    def fake_filter_channels(channels, *, country_code, search, skip):
+        calls["search"] = search
+        return []
+
+    monkeypatch.setattr("app.main.get_channels", lambda: [])
+    monkeypatch.setattr("app.main.filter_channels", fake_filter_channels)
+
+    response = client.get("/catalog/tv/channels_all/search=sky+sports.json")
+
+    assert response.status_code == 200
+    assert calls["search"] == "sky sports"
 
 
 def test_meta_unknown_channel_maps_watch_404_to_not_found(monkeypatch) -> None:
@@ -94,3 +114,13 @@ def test_invalid_config_token_falls_back_to_default_manifest() -> None:
     assert response.status_code == 200
     assert response.json()["version"] == "0.1.3"
     assert response.json()["behaviorHints"]["configurable"] is True
+
+
+def test_raw_json_config_route_accepts_label_with_slash() -> None:
+    client = TestClient(app)
+    raw_config = json.dumps({"preferredCountryCode": "global|Global / Regional"})
+
+    response = client.get(f"/{quote(raw_config, safe='')}/manifest.json")
+
+    assert response.status_code == 200
+    assert response.json()["version"] == "0.1.3"

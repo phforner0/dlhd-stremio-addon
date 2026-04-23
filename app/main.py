@@ -2,14 +2,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-import ipaddress
 import json
 import logging
 import re
 import threading
-import socket
 from time import perf_counter
-from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
+from urllib.parse import quote, unquote_plus, urlencode, urljoin, urlparse
 
 import requests
 
@@ -33,6 +31,7 @@ from app.logging_utils import (
 )
 from app.manifest import build_manifest
 from app.models import CatalogChannel, LiveEvent, WrapperCatalog
+from app.net_safety import BodyTooLarge, host_allowed as host_in_allowlist, public_host, read_response_text, response_peer_public
 from app.posters import render_svg_background, render_svg_poster
 from app.resolve.player import PlaywrightResolver
 from app.scrape.channels import filter_channels, scrape_channels
@@ -289,14 +288,7 @@ def _dynamic_proxy_host_cache_key(host: str) -> str:
 
 
 def _static_host_allowed(host: str) -> bool:
-    lowered = host.lower()
-    for allowed in settings.PROXY_ALLOWED_HOSTS:
-        if allowed.startswith("."):
-            if lowered == allowed[1:] or lowered.endswith(allowed):
-                return True
-        elif lowered == allowed:
-            return True
-    return False
+    return host_in_allowlist(host, settings.PROXY_ALLOWED_HOSTS)
 
 
 def _host_allowed(host: str) -> bool:
@@ -336,27 +328,11 @@ def _remember_dynamic_manifest_host(manifest_url: str, source_url: str) -> None:
 
 
 def _public_host(host: str) -> bool:
-    try:
-        resolved = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except socket.gaierror:
-        return False
+    return public_host(host)
 
-    for entry in resolved:
-        ip = entry[4][0]
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            return False
-        if (
-            addr.is_private
-            or addr.is_loopback
-            or addr.is_link_local
-            or addr.is_multicast
-            or addr.is_reserved
-            or addr.is_unspecified
-        ):
-            return False
-    return True
+
+def _media_redirect_host_allowed(host: str) -> bool:
+    return host_in_allowlist(host, settings.PROXY_MEDIA_REDIRECT_ALLOWED_HOSTS)
 
 
 def _proxy_url_error(raw_url: str) -> tuple[int | None, str | None]:
@@ -398,7 +374,7 @@ def _proxy_redirect_decision(current_url: str, target_url: str) -> tuple[bool, s
         return True, None, "allowlisted_host"
 
     if current.hostname and _host_allowed(current.hostname) and current.path.startswith("/redirect/media/"):
-        if target.path.startswith("/media/"):
+        if target.hostname and _media_redirect_host_allowed(target.hostname) and target.path.startswith("/media/"):
             return True, None, "media_chain"
         return False, "redirect_host_blocked", "media_chain"
 
@@ -482,7 +458,12 @@ def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> tuple[bool, 
             return False, reason
 
         if _is_hls_playlist_candidate(response.url, content_type):
-            body = response.text
+            try:
+                body = read_response_text(response, settings.HLS_PLAYLIST_MAX_BYTES)
+            except BodyTooLarge:
+                response.close()
+                log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="playlist_too_large", depth=depth, **proxy_url_fields(url))
+                return False, "playlist_too_large"
             response.close()
             if not _looks_like_hls_playlist(body):
                 log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="not_extm3u", depth=depth, **proxy_url_fields(url))
@@ -518,6 +499,8 @@ def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> tuple[bool, 
         log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="media_redirect_blocked", depth=depth, **proxy_url_fields(url))
         return False, "media_redirect_blocked"
     except requests.HTTPError as exc:
+        if exc.response is not None:
+            exc.response.close()
         status_code = exc.response.status_code if exc.response is not None else None
         if status_code == 403:
             reason = "media_http_403"
@@ -565,6 +548,17 @@ def _background_url(request: Request, meta_id: str) -> str:
     return f"{_service_base_url(request)}/assets/background/{quote(meta_id, safe='')}"
 
 
+def _asset_headers(max_age_seconds: int) -> dict[str, str]:
+    return {
+        "Cache-Control": f"public, max-age={max_age_seconds}",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+def _svg_response(svg: str, *, max_age_seconds: int = 3600) -> Response:
+    return Response(content=svg, media_type="image/svg+xml", headers=_asset_headers(max_age_seconds))
+
+
 def _parse_extra(extra: str | None) -> dict[str, str]:
     parsed: dict[str, str] = {}
     if not extra:
@@ -573,7 +567,7 @@ def _parse_extra(extra: str | None) -> dict[str, str]:
         if not segment or "=" not in segment:
             continue
         key, value = segment.split("=", 1)
-        parsed[key] = unquote(value)
+        parsed[unquote_plus(key)] = unquote_plus(value)
     return parsed
 
 
@@ -792,13 +786,23 @@ def refresh_schedule() -> list[LiveEvent]:
     return events
 
 
+def _refresh_schedule_payload(started_at: float) -> list[LiveEvent]:
+    events = _timed_call("schedule scrape", lambda: scrape_schedule(get_channel_index()), started_at=started_at)
+    schedule_index_cache.set(
+        "schedule:index",
+        {event.meta_id: event for event in events},
+        settings.SCHEDULE_CACHE_TTL_SECONDS,
+    )
+    return events
+
+
 def get_schedule() -> list[LiveEvent]:
     started_at = perf_counter()
     return schedule_cache.remember_stale(
         "schedule",
         settings.SCHEDULE_CACHE_TTL_SECONDS,
         settings.SCHEDULE_CACHE_STALE_SECONDS,
-        lambda: _timed_call("schedule scrape", lambda: scrape_schedule(get_channel_index()), started_at=started_at),
+        lambda: _refresh_schedule_payload(started_at),
     )
 
 
@@ -945,7 +949,7 @@ def _artwork_response(meta_id: str, *, variant: str) -> Response:
         kind, value = _parse_meta_id(meta_id)
     except HTTPException:
         svg = _fallback_artwork_svg(meta_id, variant=variant)
-        return Response(content=svg, media_type="image/svg+xml")
+        return _svg_response(svg)
 
     if kind == "channel":
         channel = get_channel_index().get(value)
@@ -963,7 +967,7 @@ def _artwork_response(meta_id: str, *, variant: str) -> Response:
         event = _find_event(value)
         if event is None:
             svg = _fallback_artwork_svg(meta_id, variant=variant)
-            return Response(content=svg, media_type="image/svg+xml")
+            return _svg_response(svg)
         resolution = resolve_event_artwork(event)
 
     image_url = resolution.poster_url if variant == "poster" else resolution.background_url
@@ -972,7 +976,7 @@ def _artwork_response(meta_id: str, *, variant: str) -> Response:
     if image_url:
         try:
             body, media_type = fetch_artwork_binary(image_url)
-            return Response(content=body, media_type=media_type)
+            return Response(content=body, media_type=media_type, headers=_asset_headers(settings.ARTWORK_IMAGE_CACHE_TTL_SECONDS))
         except Exception as exc:  # noqa: BLE001
             log_event(
                 LOGGER,
@@ -986,9 +990,9 @@ def _artwork_response(meta_id: str, *, variant: str) -> Response:
     if kind == "live":
         badge_svg = resolve_event_badge_svg(event, aspect=variant)
         if badge_svg:
-            return Response(content=badge_svg, media_type="image/svg+xml")
+            return _svg_response(badge_svg)
 
-    return Response(content=_fallback_artwork_svg(meta_id, variant=variant), media_type="image/svg+xml")
+    return _svg_response(_fallback_artwork_svg(meta_id, variant=variant))
 
 
 def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
@@ -1179,6 +1183,11 @@ def _follow_proxy_redirects(
             allow_redirects=False,
             headers=headers,
         )
+        if not response_peer_public(response):
+            response.close()
+            if log_fields is not None:
+                log_event(LOGGER, logging.WARNING, "proxy_url_rejected", **log_fields, reason="private_peer_ip")
+            raise HTTPException(status_code=403, detail="disallowed upstream address")
 
         if 300 <= response.status_code < 400 and response.headers.get("Location"):
             location = urljoin(current_url, response.headers["Location"])
@@ -1607,7 +1616,7 @@ def healthz() -> dict:
 
 
 @app.get("/manifest.json")
-@app.get("/{config}/manifest.json")
+@app.get("/{config:path}/manifest.json")
 def manifest(request: Request, config: str | None = None) -> JSONResponse:
     user_config = _parse_user_config_for_request(request, config)
     manifest_payload = build_manifest(_service_base_url(request), configured=bool(user_config), user_config=user_config)
@@ -1626,15 +1635,15 @@ def manifest(request: Request, config: str | None = None) -> JSONResponse:
 
 
 @app.head("/manifest.json")
-@app.head("/{config}/manifest.json")
+@app.head("/{config:path}/manifest.json")
 def manifest_head(config: str | None = None) -> Response:
     return Response(media_type="application/json")
 
 
 @app.get("/catalog/tv/{catalog_id}.json")
 @app.get("/catalog/tv/{catalog_id}/{extra:path}.json")
-@app.get("/{config}/catalog/tv/{catalog_id}.json")
-@app.get("/{config}/catalog/tv/{catalog_id}/{extra:path}.json")
+@app.get("/{config:path}/catalog/tv/{catalog_id}.json")
+@app.get("/{config:path}/catalog/tv/{catalog_id}/{extra:path}.json")
 def catalog(request: Request, catalog_id: str, extra: str | None = None, config: str | None = None) -> JSONResponse:
     catalog_def = _find_catalog(catalog_id)
     extra_props = _parse_extra(extra)
@@ -1689,7 +1698,7 @@ def catalog(request: Request, catalog_id: str, extra: str | None = None, config:
 
 
 @app.get("/meta/tv/{meta_id:path}.json")
-@app.get("/{config}/meta/tv/{meta_id:path}.json")
+@app.get("/{config:path}/meta/tv/{meta_id:path}.json")
 def meta(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
     user_config = _parse_user_config_for_request(request, config)
@@ -1755,7 +1764,7 @@ def meta(request: Request, meta_id: str, config: str | None = None) -> JSONRespo
 
 
 @app.get("/stream/tv/{meta_id:path}.json")
-@app.get("/{config}/stream/tv/{meta_id:path}.json")
+@app.get("/{config:path}/stream/tv/{meta_id:path}.json")
 def stream(request: Request, meta_id: str, config: str | None = None) -> JSONResponse:
     kind, value = _parse_meta_id(meta_id)
     user_config = _parse_user_config_for_request(request, config)
@@ -1900,6 +1909,8 @@ def proxy_media(
         raise HTTPException(status_code=503, detail="upstream temporarily unavailable") from exc
     except requests.RequestException as exc:
         status_code = exc.response.status_code if exc.response is not None else None
+        if exc.response is not None:
+            exc.response.close()
         log_event(
             LOGGER,
             logging.WARNING,
@@ -1909,12 +1920,16 @@ def proxy_media(
             reason=exc.__class__.__name__,
             **proxy_url_fields(validated_url),
         )
-        raise
+        raise HTTPException(status_code=502, detail="upstream request failed") from exc
 
     content_type = upstream.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
 
     if playlist_cache_key is not None:
-        body = upstream.text
+        try:
+            body = read_response_text(upstream, settings.HLS_PLAYLIST_MAX_BYTES)
+        except BodyTooLarge as exc:
+            upstream.close()
+            raise HTTPException(status_code=502, detail="upstream playlist too large") from exc
         upstream.close()
 
         if not _looks_like_hls_playlist(body):
@@ -1983,18 +1998,18 @@ def proxy_media_head(filename: str) -> Response:
 @app.get("/assets/logo.svg")
 def logo() -> Response:
     svg = render_svg_poster(settings.ADDON_NAME, "Stremio addon", "global")
-    return Response(content=svg, media_type="image/svg+xml")
+    return _svg_response(svg, max_age_seconds=86400)
 
 
 @app.get("/assets/background.svg")
 def background() -> Response:
     svg = render_svg_background(settings.ADDON_NAME, settings.ADDON_DESCRIPTION, "global")
-    return Response(content=svg, media_type="image/svg+xml")
+    return _svg_response(svg, max_age_seconds=86400)
 
 
 @app.get("/assets/background/{meta_id:path}.svg")
 def background_svg(meta_id: str) -> Response:
-    return Response(content=_fallback_artwork_svg(meta_id, variant="background"), media_type="image/svg+xml")
+    return _svg_response(_fallback_artwork_svg(meta_id, variant="background"))
 
 
 @app.get("/assets/background/{meta_id:path}")
@@ -2004,7 +2019,7 @@ def background_asset(meta_id: str) -> Response:
 
 @app.get("/assets/poster/{meta_id:path}.svg")
 def poster_svg(meta_id: str) -> Response:
-    return Response(content=_fallback_artwork_svg(meta_id, variant="poster"), media_type="image/svg+xml")
+    return _svg_response(_fallback_artwork_svg(meta_id, variant="poster"))
 
 
 @app.get("/assets/poster/{meta_id:path}")

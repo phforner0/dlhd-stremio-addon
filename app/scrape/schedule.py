@@ -15,6 +15,7 @@ from app.http import build_session
 from app.logging_utils import log_event, proxy_url_fields
 from app.models import CatalogChannel, LiveEvent, ScheduleChannelLink
 from app.normalize.country import classify_channel_country, classify_event_countries
+from app.upstream_health import guarded_get
 
 LOGGER = logging.getLogger("dlhd.scrape.schedule")
 
@@ -108,7 +109,12 @@ def scrape_schedule(channel_index: dict[int, CatalogChannel] | None = None) -> l
     log_event(LOGGER, logging.INFO, "scrape_schedule_start", **proxy_url_fields(settings.BASE_SITE_URL))
     try:
         with build_session() as session:
-            response = session.get(settings.BASE_SITE_URL, timeout=settings.HTTP_TIMEOUT_SECONDS)
+            response = guarded_get(
+                session,
+                settings.BASE_SITE_URL,
+                operation="scrape_schedule",
+                timeout=settings.HTTP_TIMEOUT_SECONDS,
+            )
             response.raise_for_status()
             response.encoding = response.encoding or "utf-8"
     except requests.RequestException as exc:

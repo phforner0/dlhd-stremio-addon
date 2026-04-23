@@ -12,6 +12,7 @@ from app.http import build_session
 from app.logging_utils import log_event, proxy_url_fields
 from app.models import CatalogChannel
 from app.normalize.country import classify_channel_country
+from app.upstream_health import guarded_get
 
 LOGGER = logging.getLogger("dlhd.scrape.channels")
 
@@ -22,8 +23,10 @@ def scrape_channels() -> list[CatalogChannel]:
     log_event(LOGGER, logging.INFO, "scrape_channels_start", **proxy_url_fields(url))
     try:
         with build_session() as session:
-            response = session.get(
+            response = guarded_get(
+                session,
                 url,
+                operation="scrape_channels",
                 timeout=settings.HTTP_TIMEOUT_SECONDS,
             )
             response.raise_for_status()

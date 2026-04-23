@@ -70,6 +70,7 @@ def test_extract_embed_proxy_manifest_from_premiumtv_fixture(monkeypatch) -> Non
         "app.resolve.player.build_session",
         lambda: _FakeSession({}),
     )
+    monkeypatch.setattr("app.resolve.player.public_host", lambda host: True)
 
     manifests = _extract_embed_proxy_manifest(_fixture_text("embed_premiumtv_81.html"))
 
@@ -82,6 +83,7 @@ def test_extract_embed_proxy_manifest_from_url_uses_fixture_html(monkeypatch) ->
         "app.resolve.player.build_session",
         lambda: _FakeSession({iframe_url: _fixture_text("embed_viewembed_espnbrazil.html")}),
     )
+    monkeypatch.setattr("app.resolve.player.public_host", lambda host: True)
 
     manifests = _extract_embed_proxy_manifest_from_url(iframe_url, "https://dlstreams.top/watch/stream-81.php")
 
@@ -126,6 +128,7 @@ def test_bootstrap_from_url_uses_player_context_for_known_host_path_drift(monkey
         "app.resolve.player.build_session",
         lambda: _FakeSession({iframe_url: _fixture_text("embed_viewembed_espnbrazil.html")}),
     )
+    monkeypatch.setattr("app.resolve.player.public_host", lambda host: True)
 
     manifests = _extract_embed_proxy_manifest_from_url(
         iframe_url,

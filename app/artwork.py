@@ -17,15 +17,17 @@ from app.cache import TTLCache
 from app.http import build_session
 from app.logging_utils import hash_url, log_event
 from app.models import CatalogChannel, LiveEvent, WrapperCatalog
+from app.net_safety import BodyTooLarge, host_allowed, public_host, read_response_bytes, response_peer_public
 from app.upstream_health import guarded_get
 
 LOGGER = logging.getLogger("dlhd.artwork")
-IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/svg+xml"}
+IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 CHANNEL_ARTWORK_CACHE: TTLCache["ArtworkResolution"] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="channel_artwork")
 EVENT_ARTWORK_CACHE: TTLCache["ArtworkResolution"] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="event_artwork")
 EVENT_BADGE_SVG_CACHE: TTLCache["_OptionalValue"] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="event_badge_svg")
 TEAM_ARTWORK_CACHE: TTLCache["_OptionalValue"] = TTLCache(max_entries=settings.ARTWORK_CACHE_MAX_ENTRIES, name="team_artwork")
 IMAGE_BINARY_CACHE: TTLCache[tuple[bytes, str]] = TTLCache(max_entries=settings.ARTWORK_IMAGE_CACHE_MAX_ENTRIES, name="artwork_image")
+IMAGE_BINARY_MISS_CACHE: TTLCache[bool] = TTLCache(max_entries=settings.ARTWORK_IMAGE_CACHE_MAX_ENTRIES, name="artwork_image_miss")
 PLACEHOLDER_POSTER_PATHS = {"/assets/logos/logo.png"}
 PLACEHOLDER_POSTER_RE = re.compile(r"/(?:logo|default|placeholder)(?:\.[a-z0-9]+)?$", re.I)
 PLACEHOLDER_POSTER_HOSTS = {"dlstreams.com", "www.dlstreams.com", "dlstreams.top", "www.dlstreams.top"}
@@ -83,15 +85,17 @@ def _remember_cached_optional(cache: TTLCache[_OptionalValue], key: str, factory
     return value
 
 
-def _host_matches(host: str, allowed: str) -> bool:
-    lowered = host.lower()
-    if allowed.startswith("."):
-        return lowered == allowed[1:] or lowered.endswith(allowed)
-    return lowered == allowed
-
-
 def _host_allowed(host: str) -> bool:
-    return any(_host_matches(host, allowed) for allowed in settings.ARTWORK_ALLOWED_HOSTS)
+    return host_allowed(host, settings.ARTWORK_ALLOWED_HOSTS)
+
+
+def _safe_artwork_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or not _host_allowed(parsed.hostname):
+        raise ValueError("disallowed artwork host")
+    if not public_host(parsed.hostname):
+        raise ValueError("disallowed artwork address")
+    return url
 
 
 def _normalized_remote_url(url: str | None, *, base_url: str | None = None) -> str | None:
@@ -569,7 +573,17 @@ def resolve_event_badge_svg(event: LiveEvent, *, aspect: str = "poster") -> str 
 
         best_match = _best_event_candidate(event, minimum_score=45)
         if best_match is not None:
-            return _league_badge_svg(event, best_match[1], aspect=aspect)
+            try:
+                return _league_badge_svg(event, best_match[1], aspect=aspect)
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    logging.DEBUG,
+                    "event_badge_artwork_failed",
+                    event_id=event.meta_id,
+                    reason=exc.__class__.__name__,
+                )
+                return None
         return None
 
     return _remember_cached_optional(EVENT_BADGE_SVG_CACHE, cache_key, factory)
@@ -606,25 +620,56 @@ def fetch_artwork_binary(url: str) -> tuple[bytes, str]:
     cached = IMAGE_BINARY_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    if IMAGE_BINARY_MISS_CACHE.get(cache_key) is True:
+        raise ValueError("cached artwork fetch failure")
 
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or not _host_allowed(parsed.hostname):
-        raise ValueError("disallowed artwork host")
+    try:
+        with build_session() as session:
+            current_url = _safe_artwork_url(url)
+            response = None
+            for _ in range(settings.PROXY_MAX_REDIRECTS + 1):
+                response = guarded_get(
+                    session,
+                    current_url,
+                    operation="artwork_fetch",
+                    timeout=settings.HTTP_TIMEOUT_SECONDS,
+                    stream=True,
+                    allow_redirects=False,
+                )
+                if not response_peer_public(response):
+                    response.close()
+                    raise ValueError("disallowed artwork address")
+                if 300 <= response.status_code < 400 and response.headers.get("Location"):
+                    next_url = urljoin(current_url, response.headers["Location"])
+                    response.close()
+                    current_url = _safe_artwork_url(next_url)
+                    continue
+                break
+            else:
+                raise ValueError("too many artwork redirects")
 
-    with build_session() as session:
-        response = guarded_get(session, url, operation="artwork_fetch", timeout=settings.HTTP_TIMEOUT_SECONDS, stream=True, allow_redirects=True)
-        response.raise_for_status()
-        final_url = response.url
-        final_host = urlparse(final_url).hostname
-        if not final_host or not _host_allowed(final_host):
-            response.close()
-            raise ValueError("disallowed redirect artwork host")
-        content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip().lower()
-        if content_type not in IMAGE_CONTENT_TYPES:
-            response.close()
-            raise ValueError("invalid artwork content type")
-        body = response.content
-        response.close()
+            if response is None:
+                raise ValueError("artwork fetch failed")
+            try:
+                response.raise_for_status()
+            except Exception:
+                response.close()
+                raise
+            content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip().lower()
+            if content_type not in IMAGE_CONTENT_TYPES:
+                response.close()
+                raise ValueError("invalid artwork content type")
+            try:
+                body = read_response_bytes(response, settings.ARTWORK_IMAGE_MAX_BYTES)
+            except BodyTooLarge:
+                response.close()
+                raise ValueError("artwork image too large") from None
+            finally:
+                response.close()
+    except Exception:
+        IMAGE_BINARY_MISS_CACHE.set(cache_key, True, settings.ARTWORK_MISS_CACHE_TTL_SECONDS)
+        raise
 
+    IMAGE_BINARY_MISS_CACHE.delete(cache_key)
     IMAGE_BINARY_CACHE.set(cache_key, (body, content_type), settings.ARTWORK_IMAGE_CACHE_TTL_SECONDS)
     return body, content_type

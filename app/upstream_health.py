@@ -133,7 +133,6 @@ class UpstreamHealth:
                 self._states[host] = state
 
             state.failure_count += 1
-            state.window_started_at = now
             failure_count = state.failure_count
             if state.failure_count >= self._failure_threshold and state.cooldown_until <= now:
                 state.cooldown_until = now + self._cooldown_seconds

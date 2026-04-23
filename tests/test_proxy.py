@@ -173,6 +173,28 @@ def test_proxy_allows_redirect_media_chain_to_public_media_host(monkeypatch) -> 
     assert response.status_code == 200
 
 
+def test_proxy_rejects_media_chain_to_unlisted_public_host(monkeypatch) -> None:
+    client = TestClient(app)
+    session = FakeSession(
+        {
+            "https://embedkclx.sbs/redirect/media/test/path.js": FakeResponse(
+                "https://embedkclx.sbs/redirect/media/test/path.js",
+                status_code=302,
+                headers={"Location": "https://public.example.test/media/test/path.js"},
+            )
+        }
+    )
+    monkeypatch.setattr("app.main.get_pooled_session", lambda: session)
+    monkeypatch.setattr("app.main._public_host", lambda host: True)
+
+    response = client.get(
+        "/proxy/path.js",
+        params={"url": "https://embedkclx.sbs/redirect/media/test/path.js", "referer": "https://embedkclx.sbs/premiumtv/daddyhd.php?id=81"},
+    )
+
+    assert response.status_code == 403
+
+
 def test_proxy_playlist_cache_isolated_by_host(monkeypatch) -> None:
     client = TestClient(app)
     playlist_cache.prune()
@@ -206,6 +228,29 @@ def test_proxy_playlist_cache_isolated_by_host(monkeypatch) -> None:
     assert "https://b.example/proxy/segment.ts" not in response_a.text
     assert response_a.status_code == 200
     assert response_b.status_code == 200
+
+
+def test_proxy_rejects_oversized_playlist(monkeypatch) -> None:
+    client = TestClient(app)
+    session = FakeSession(
+        {
+            "https://embedkclx.sbs/proxy/test/mono.css": FakeResponse(
+                "https://embedkclx.sbs/proxy/test/mono.css",
+                headers={"Content-Type": "application/vnd.apple.mpegurl"},
+                text="#EXTM3U\n" + "a" * 32,
+            )
+        }
+    )
+    monkeypatch.setattr("app.main.get_pooled_session", lambda: session)
+    monkeypatch.setattr("app.main._public_host", lambda host: True)
+    monkeypatch.setattr("app.settings.HLS_PLAYLIST_MAX_BYTES", 8)
+
+    response = client.get(
+        "/proxy/stream.m3u8",
+        params={"url": "https://embedkclx.sbs/proxy/test/mono.css", "referer": "https://embedkclx.sbs/premiumtv/daddyhd.php?id=81"},
+    )
+
+    assert response.status_code == 502
 
 
 def test_proxy_passes_range_header(monkeypatch) -> None:

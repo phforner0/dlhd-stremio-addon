@@ -8,6 +8,7 @@ from app.artwork import (
     CHANNEL_ARTWORK_CACHE,
     EVENT_ARTWORK_CACHE,
     EVENT_BADGE_SVG_CACHE,
+    IMAGE_BINARY_MISS_CACHE,
     ArtworkResolution,
     _candidate_score,
     fetch_artwork_binary,
@@ -16,6 +17,7 @@ from app.artwork import (
     resolve_event_artwork,
 )
 from app import settings
+from app.logging_utils import hash_url
 from app.models import (
     CatalogChannel,
     ChannelInfo,
@@ -28,6 +30,8 @@ from app.models import (
     SourceInfo,
     WrapperCatalog,
 )
+
+POSTER_URL = "https://r2.thesportsdb.com/images/media/event/poster/poster.jpg"
 
 
 def _channel() -> CatalogChannel:
@@ -218,9 +222,11 @@ def test_resolve_event_badge_svg_builds_composed_svg_from_team_badges(monkeypatc
 
 
 def test_fetch_artwork_binary_rejects_non_image_content(monkeypatch) -> None:
+    IMAGE_BINARY_MISS_CACHE.delete(f"image:{hash_url(POSTER_URL)}")
+
     class FakeResponse:
         status_code = 200
-        url = "https://r2.thesportsdb.com/images/media/event/poster/poster.jpg"
+        url = POSTER_URL
         headers = {"Content-Type": "text/html; charset=utf-8"}
         content = b"<html></html>"
 
@@ -239,6 +245,74 @@ def test_fetch_artwork_binary_rejects_non_image_content(monkeypatch) -> None:
 
     monkeypatch.setattr("app.artwork.build_session", lambda: FakeSession())
     monkeypatch.setattr("app.artwork.guarded_get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr("app.artwork.public_host", lambda host: True)
 
     with pytest.raises(ValueError):
-        fetch_artwork_binary("https://r2.thesportsdb.com/images/media/event/poster/poster.jpg")
+        fetch_artwork_binary(POSTER_URL)
+
+
+def test_fetch_artwork_binary_rejects_remote_svg(monkeypatch) -> None:
+    class FakeResponse:
+        status_code = 200
+        url = "https://r2.thesportsdb.com/images/media/event/poster/poster.svg"
+        headers = {"Content-Type": "image/svg+xml"}
+        content = b"<svg></svg>"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("app.artwork.build_session", lambda: FakeSession())
+    monkeypatch.setattr("app.artwork.guarded_get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr("app.artwork.public_host", lambda host: True)
+
+    with pytest.raises(ValueError):
+        fetch_artwork_binary("https://r2.thesportsdb.com/images/media/event/poster/poster.svg")
+
+
+def test_fetch_artwork_binary_rejects_private_resolved_host(monkeypatch) -> None:
+    IMAGE_BINARY_MISS_CACHE.delete(f"image:{hash_url(POSTER_URL)}")
+    monkeypatch.setattr("app.artwork.public_host", lambda host: False)
+
+    with pytest.raises(ValueError):
+        fetch_artwork_binary(POSTER_URL)
+
+
+def test_fetch_artwork_binary_rejects_oversized_image(monkeypatch) -> None:
+    IMAGE_BINARY_MISS_CACHE.delete(f"image:{hash_url(POSTER_URL)}")
+
+    class FakeResponse:
+        status_code = 200
+        url = POSTER_URL
+        headers = {"Content-Type": "image/jpeg"}
+        content = b"123456789"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("app.artwork.build_session", lambda: FakeSession())
+    monkeypatch.setattr("app.artwork.guarded_get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr("app.artwork.public_host", lambda host: True)
+    monkeypatch.setattr(settings, "ARTWORK_IMAGE_MAX_BYTES", 4)
+
+    with pytest.raises(ValueError):
+        fetch_artwork_binary(POSTER_URL)

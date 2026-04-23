@@ -15,6 +15,7 @@ from app import settings
 from app.http import DEFAULT_HEADERS, build_session
 from app.logging_utils import log_event, proxy_url_fields
 from app.models import ManifestResult, PlayerResolution, WrapperCatalog
+from app.net_safety import public_host
 from app.resolve.providers import BootstrapInputs, bootstrap_parse_results, should_attempt_bootstrap_fetch
 from app.upstream_health import guarded_get
 
@@ -55,9 +56,9 @@ def _should_ignore_https_errors(player_url: str) -> bool:
     return any(_host_matches(host, allowed) for allowed in settings.PLAYWRIGHT_IGNORE_HTTPS_ERROR_HOSTS)
 
 MANIFEST_RE: tuple[re.Pattern[str], ...] = (
-    re.compile(r'(https?://[^\s\'"<>{}\[\]\\]+\.m3u8(?:[?#][^\s\'"<>]*)?)', re.I),
-    re.compile(r'(https?://[^\s\'"<>{}\[\]\\]+\.mpd(?:[?#][^\s\'"<>]*)?)', re.I),
-    re.compile(r'(https?://[^\s\'"<>{}\[\]\\]+\.(?:mp4|webm|ts|flv)(?:[?#][^\s\'"<>]*)?)', re.I),
+    re.compile(r'((?:https?:)?//[^\s\'"<>{}\[\]\\]+\.m3u8(?:[?#][^\s\'"<>]*)?)', re.I),
+    re.compile(r'((?:https?:)?//[^\s\'"<>{}\[\]\\]+\.mpd(?:[?#][^\s\'"<>]*)?)', re.I),
+    re.compile(r'((?:https?:)?//[^\s\'"<>{}\[\]\\]+\.(?:mp4|webm|ts|flv)(?:[?#][^\s\'"<>]*)?)', re.I),
 )
 
 STREAM_ATTRS: tuple[str, ...] = (
@@ -153,14 +154,33 @@ def _proxy_manifest_from_parts(server: str, server_key: str, channel_key: str) -
     )
 
 
+def _bootstrap_url_public(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname) and public_host(parsed.hostname)
+
+
+def _bootstrap_server_public(server: str) -> bool:
+    parsed = urlparse(f"https://{server}")
+    return (
+        bool(parsed.hostname)
+        and not parsed.username
+        and not parsed.password
+        and parsed.path in {"", "/"}
+        and public_host(parsed.hostname)
+    )
+
+
 def _resolve_bootstrap_inputs(inputs: BootstrapInputs, *, timeout: int = 10) -> tuple[list[str], str | None, int]:
     last_reason = "status_probe_failed"
+    servers = tuple(server for server in inputs.servers if _bootstrap_server_public(server))
+    if not servers:
+        return [], "unsafe_bootstrap_server", 1
 
     try:
         with build_session() as session:
             session.headers.update({"Accept": "application/json, text/plain, */*"})
-            selected_server = inputs.servers[0]
-            for server in inputs.servers:
+            selected_server = servers[0]
+            for server in servers:
                 try:
                     response = guarded_get(session, f"https://{server}/status", operation="resolver_bootstrap", timeout=timeout)
                     response.raise_for_status()
@@ -174,7 +194,7 @@ def _resolve_bootstrap_inputs(inputs: BootstrapInputs, *, timeout: int = 10) -> 
                     LOGGER.debug("Status probe failed for %s: %s", server, exc)
                     last_reason = "upstream_circuit_open" if exc.__class__.__name__ == "UpstreamCircuitOpen" else "status_probe_failed"
                     if last_reason == "upstream_circuit_open":
-                        return [], last_reason, 1
+                        continue
 
             for attempt in range(1, 3):
                 try:
@@ -285,6 +305,8 @@ def _extract_embed_proxy_manifest_from_url(
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return []
+    if not _bootstrap_url_public(url):
+        return []
     if not should_attempt_bootstrap_fetch(url):
         return []
 
@@ -325,6 +347,8 @@ def _derive_proxy_manifest_from_lookup(response: Any, timeout: int = 10) -> str 
         return None
 
     server_host = urlparse(response.url).netloc
+    if not _bootstrap_server_public(server_host):
+        return None
     proxy_manifest = (
         f"https://{server_host}/proxy/top1/cdn/{channel_key}/mono.css"
         if server_key == "top1/cdn"
@@ -344,12 +368,15 @@ def _derive_proxy_manifest_from_lookup(response: Any, timeout: int = 10) -> str 
 def _scan_text(text: str) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
-    for pattern in MANIFEST_RE:
-        for match in pattern.finditer(text):
-            url = match.group(1).rstrip("'\",\\")
-            if url not in seen:
-                seen.add(url)
-                found.append(url)
+    for candidate_text in (text, text.replace(r"\/", "/")):
+        for pattern in MANIFEST_RE:
+            for match in pattern.finditer(candidate_text):
+                url = match.group(1).rstrip("'\",\\")
+                if url.startswith("//"):
+                    url = f"https:{url}"
+                if url not in seen:
+                    seen.add(url)
+                    found.append(url)
     return found
 
 
