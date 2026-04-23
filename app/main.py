@@ -101,6 +101,10 @@ manifest_validation_reason_cache: TTLCache[str] = TTLCache(
     max_entries=settings.HLS_VALIDATION_MAX_ENTRIES,
     name="manifest_validation_reason",
 )
+dynamic_proxy_host_cache: TTLCache[bool] = TTLCache(
+    max_entries=settings.HLS_VALIDATION_MAX_ENTRIES,
+    name="dynamic_proxy_host",
+)
 resolver = PlaywrightResolver()
 RESOURCE_LOG_STOP = threading.Event()
 RESOURCE_LOG_THREAD: threading.Thread | None = None
@@ -177,6 +181,7 @@ def _cache_counts() -> dict[str, int]:
         "live_channel_entries": live_channel_stream_cache.entry_count(),
         "playlist_entries": playlist_cache.entry_count(),
         "manifest_validation_entries": manifest_validation_cache.entry_count(),
+        "dynamic_proxy_host_entries": dynamic_proxy_host_cache.entry_count(),
     }
 
 
@@ -279,7 +284,11 @@ def _hls_validation_cache_key(manifest_url: str, referer: str) -> str:
     return f"hls-valid:{manifest_url}|{referer}"
 
 
-def _host_allowed(host: str) -> bool:
+def _dynamic_proxy_host_cache_key(host: str) -> str:
+    return f"dynamic-proxy-host:{host.lower()}"
+
+
+def _static_host_allowed(host: str) -> bool:
     lowered = host.lower()
     for allowed in settings.PROXY_ALLOWED_HOSTS:
         if allowed.startswith("."):
@@ -288,6 +297,42 @@ def _host_allowed(host: str) -> bool:
         elif lowered == allowed:
             return True
     return False
+
+
+def _host_allowed(host: str) -> bool:
+    lowered = host.lower()
+    return _static_host_allowed(lowered) or dynamic_proxy_host_cache.get(_dynamic_proxy_host_cache_key(lowered)) is True
+
+
+def _trusted_player_source(source_url: str) -> bool:
+    parsed = urlparse(source_url)
+    return parsed.scheme in {"http", "https"} and parsed.hostname is not None and _static_host_allowed(parsed.hostname)
+
+
+def _dlhd_proxy_manifest_url(manifest_url: str) -> bool:
+    parsed = urlparse(manifest_url)
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.hostname is not None
+        and parsed.path.lower().startswith("/proxy/")
+        and parsed.path.lower().endswith("/mono.css")
+    )
+
+
+def _remember_dynamic_manifest_host(manifest_url: str, source_url: str) -> None:
+    parsed = urlparse(manifest_url)
+    if not parsed.hostname or not _dlhd_proxy_manifest_url(manifest_url) or not _trusted_player_source(source_url):
+        return
+
+    host = parsed.hostname.lower()
+    if _static_host_allowed(host):
+        return
+
+    dynamic_proxy_host_cache.set(
+        _dynamic_proxy_host_cache_key(host),
+        True,
+        settings.WATCH_CACHE_TTL_SECONDS,
+    )
 
 
 def _public_host(host: str) -> bool:
@@ -1319,6 +1364,9 @@ def _build_channel_streams(channel: CatalogChannel, request: Request, config: di
                             **proxy_url_fields(manifest.url),
                         )
                         continue
+                    if manifest.player_type.lower() == "hls":
+                        _remember_dynamic_manifest_host(manifest.url, player_url)
+
                     if manifest.player_type.lower() == "hls" and not _valid_hls_stream(manifest.url, manifest.found_at_url):
                         log_event(
                             LOGGER,
@@ -1403,6 +1451,8 @@ def _get_live_channel_payload(linked_channel) -> tuple[dict[str, str] | None, st
         if not resolution.manifests:
             continue
         manifest = resolution.manifests[0]
+        if manifest.player_type.lower() == "hls":
+            _remember_dynamic_manifest_host(manifest.url, resolution.player_page_url)
         payload = {
             "url": manifest.url,
             "referer": manifest.found_at_url,

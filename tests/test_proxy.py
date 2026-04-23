@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from app.main import _host_allowed, app, playlist_cache
+from app.main import (
+    _dynamic_proxy_host_cache_key,
+    _host_allowed,
+    _remember_dynamic_manifest_host,
+    app,
+    dynamic_proxy_host_cache,
+    playlist_cache,
+)
 from app.upstream_health import UpstreamCircuitOpen
 
 
@@ -58,6 +65,50 @@ def test_proxy_allowlist_includes_new_embed_hosts() -> None:
     assert _host_allowed("chevy.soyspace.cyou") is True
     assert _host_allowed("chevy.vovlacosa.sbs") is True
     assert _host_allowed("img.aiphotofree.site") is True
+
+
+def test_proxy_allows_trusted_dynamic_manifest_host(monkeypatch) -> None:
+    client = TestClient(app)
+    dynamic_host = "chevy.rotatingtest.sbs"
+    dynamic_proxy_host_cache.delete(_dynamic_proxy_host_cache_key(dynamic_host))
+    session = FakeSession(
+        {
+            "https://chevy.rotatingtest.sbs/proxy/wind/premium88/mono.css": FakeResponse(
+                "https://chevy.rotatingtest.sbs/proxy/wind/premium88/mono.css",
+                headers={"Content-Type": "application/vnd.apple.mpegurl"},
+                text="#EXTM3U\n#EXTINF:4,\nhttps://img.aiphotofree.site/static/segment.js\n",
+            )
+        }
+    )
+    monkeypatch.setattr("app.main.get_pooled_session", lambda: session)
+    monkeypatch.setattr("app.main._public_host", lambda host: True)
+
+    _remember_dynamic_manifest_host(
+        "https://chevy.rotatingtest.sbs/proxy/wind/premium88/mono.css",
+        "https://dlstreams.com/stream/stream-88.php",
+    )
+    response = client.get(
+        "/proxy/stream.m3u8",
+        params={
+            "url": "https://chevy.rotatingtest.sbs/proxy/wind/premium88/mono.css",
+            "referer": "https://dlstreams.com/stream/stream-88.php",
+        },
+    )
+
+    assert response.status_code == 200
+    dynamic_proxy_host_cache.delete(_dynamic_proxy_host_cache_key(dynamic_host))
+
+
+def test_proxy_rejects_untrusted_dynamic_manifest_source() -> None:
+    dynamic_host = "chevy.untrustedtest.sbs"
+    dynamic_proxy_host_cache.delete(_dynamic_proxy_host_cache_key(dynamic_host))
+
+    _remember_dynamic_manifest_host(
+        "https://chevy.untrustedtest.sbs/proxy/wind/premium88/mono.css",
+        "https://example.com/player.html",
+    )
+
+    assert _host_allowed(dynamic_host) is False
 
 
 def test_proxy_rejects_private_ip(monkeypatch) -> None:
