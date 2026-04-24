@@ -10,6 +10,7 @@ from app.main import (
     _encode_user_config,
     _effective_country_filter,
     _event_display_values,
+    _hls_playlist_rejection_reason,
     _is_hls_playlist_candidate,
     _looks_like_hls_playlist,
     _ordered_live_channels,
@@ -46,6 +47,12 @@ def test_hls_playlist_detection_rejects_non_playlist_text() -> None:
     body = "console.log('not a playlist');"
 
     assert _looks_like_hls_playlist(body) is False
+
+
+def test_hls_playlist_rejection_detects_obfuscated_workers() -> None:
+    body = "#EXTM3U\n# uploader-meta: version=3.1.95; mode=s3; delivery=workers\nsegment.js\n"
+
+    assert _hls_playlist_rejection_reason(body) == "obfuscated_worker_playlist"
 
 
 def test_hls_playlist_candidate_accepts_css_text_playlist_sources() -> None:

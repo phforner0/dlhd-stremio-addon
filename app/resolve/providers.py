@@ -115,6 +115,8 @@ PLAYER_PAGE_HOSTS: tuple[str, ...] = (
     ".dlstreams.com",
     "dlstreams.top",
     ".dlstreams.top",
+    "ddyplayer.cfd",
+    ".ddyplayer.cfd",
 )
 
 SPECIFIC_BOOTSTRAP_STRATEGIES: tuple[BootstrapStrategy, ...] = (
@@ -165,6 +167,10 @@ BOOTSTRAP_MANIFEST_HOSTS: tuple[str, ...] = (
     ".aivideox.site",
     "aiphotofree.site",
     ".aiphotofree.site",
+    "edge.cdnlivetv.ru",
+    ".cdnlivetv.ru",
+    "edge.cdn-aws.ru",
+    ".cdn-aws.ru",
 )
 
 

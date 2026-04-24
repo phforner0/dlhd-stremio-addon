@@ -404,6 +404,13 @@ def _looks_like_hls_playlist(body: str) -> bool:
     return body.lstrip().startswith("#EXTM3U")
 
 
+def _hls_playlist_rejection_reason(body: str) -> str | None:
+    lowered = body.lower()
+    if "# uploader-meta:" in lowered and "delivery=workers" in lowered:
+        return "obfuscated_worker_playlist"
+    return None
+
+
 def _extract_hls_probe_targets(body: str, base_url: str) -> tuple[str | None, str | None]:
     key_url = None
     media_url = None
@@ -468,6 +475,18 @@ def _probe_hls_target(url: str, referer: str, *, depth: int = 0) -> tuple[bool, 
             if not _looks_like_hls_playlist(body):
                 log_event(LOGGER, logging.DEBUG, "hls_validation_fail", reason="not_extm3u", depth=depth, **proxy_url_fields(url))
                 return False, "not_extm3u"
+
+            rejection_reason = _hls_playlist_rejection_reason(body)
+            if rejection_reason:
+                log_event(
+                    LOGGER,
+                    logging.DEBUG,
+                    "hls_validation_fail",
+                    reason=rejection_reason,
+                    depth=depth,
+                    **proxy_url_fields(response.url),
+                )
+                return False, rejection_reason
 
             key_url, media_url = _extract_hls_probe_targets(body, response.url)
             if key_url is not None:
@@ -1015,7 +1034,18 @@ def _ordered_player_targets(wrapper: WrapperCatalog) -> list[tuple[str, str]]:
         seen_urls.add(alternate.url)
         targets.append((alternate.label or "alternate", alternate.url))
 
-    return targets
+    return sorted(targets, key=lambda target: _player_target_priority(target[1]))
+
+
+def _player_target_priority(player_url: str) -> int:
+    path = urlparse(player_url).path.lower()
+    if "/casting/" in path:
+        return 0
+    if "/watch/" in path:
+        return 1
+    if "/stream/" in path or "/cast/" in path:
+        return 2
+    return 3
 
 
 def _channel_player_cache_key(channel_id: int) -> str:
@@ -1943,6 +1973,18 @@ def proxy_media(
                 **proxy_url_fields(upstream.url),
             )
             return Response(content=body, media_type=content_type or "text/plain")
+
+        rejection_reason = _hls_playlist_rejection_reason(body)
+        if rejection_reason:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "proxy_playlist_rejected",
+                **request_fields,
+                reason=rejection_reason,
+                **proxy_url_fields(upstream.url),
+            )
+            raise HTTPException(status_code=502, detail="unsupported upstream playlist")
 
         rewritten = _rewrite_hls_playlist(request, body, upstream.url, validated_referer)
         playlist_cache.set(

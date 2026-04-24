@@ -543,7 +543,18 @@ def _ordered_player_targets(catalog: WrapperCatalog) -> list[tuple[str, str]]:
         seen_urls.add(alternate.url)
         targets.append((alternate.label or "alternate", alternate.url))
 
-    return targets
+    return sorted(targets, key=lambda target: _player_target_priority(target[1]))
+
+
+def _player_target_priority(player_url: str) -> int:
+    path = urlparse(player_url).path.lower()
+    if "/casting/" in path:
+        return 0
+    if "/watch/" in path:
+        return 1
+    if "/stream/" in path or "/cast/" in path:
+        return 2
+    return 3
 
 
 def _mark_wait_signal(
@@ -1087,7 +1098,7 @@ class PlaywrightResolver:
                 if not _has_manifest_hits(network_hits, dom_hits, js_hits, iframe_hits):
                     external_iframes = [
                         url for url in iframes_seen
-                        if url.startswith("http") and urlparse(url).netloc != player_host and url not in inspected_iframe_urls
+                        if url.startswith("http") and urlparse(url).netloc != player_host
                     ]
 
                     for ext_url in external_iframes:

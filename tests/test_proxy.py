@@ -65,6 +65,9 @@ def test_proxy_allowlist_includes_new_embed_hosts() -> None:
     assert _host_allowed("chevy.soyspace.cyou") is True
     assert _host_allowed("chevy.vovlacosa.sbs") is True
     assert _host_allowed("img.aiphotofree.site") is True
+    assert _host_allowed("ddyplayer.cfd") is True
+    assert _host_allowed("edge.cdnlivetv.ru") is True
+    assert _host_allowed("edge.cdn-aws.ru") is True
 
 
 def test_proxy_allows_trusted_dynamic_manifest_host(monkeypatch) -> None:
@@ -248,6 +251,36 @@ def test_proxy_rejects_oversized_playlist(monkeypatch) -> None:
     response = client.get(
         "/proxy/stream.m3u8",
         params={"url": "https://embedkclx.sbs/proxy/test/mono.css", "referer": "https://embedkclx.sbs/premiumtv/daddyhd.php?id=81"},
+    )
+
+    assert response.status_code == 502
+
+
+def test_proxy_rejects_obfuscated_worker_playlist(monkeypatch) -> None:
+    client = TestClient(app)
+    session = FakeSession(
+        {
+            "https://chevy.soyspace.cyou/proxy/x4/espnbrazil/mono.css": FakeResponse(
+                "https://chevy.soyspace.cyou/proxy/x4/espnbrazil/mono.css",
+                headers={"Content-Type": "application/vnd.apple.mpegurl"},
+                text=(
+                    "#EXTM3U\n"
+                    "# uploader-meta: version=3.1.95; mode=s3; delivery=workers\n"
+                    "#EXTINF:2,\n"
+                    "https://img.aiphotofree.site/static/fake.js\n"
+                ),
+            )
+        }
+    )
+    monkeypatch.setattr("app.main.get_pooled_session", lambda: session)
+    monkeypatch.setattr("app.main._public_host", lambda host: True)
+
+    response = client.get(
+        "/proxy/stream.m3u8",
+        params={
+            "url": "https://chevy.soyspace.cyou/proxy/x4/espnbrazil/mono.css",
+            "referer": "https://dlstreams.com/watch/stream-81.php",
+        },
     )
 
     assert response.status_code == 502
