@@ -170,6 +170,20 @@ def _bootstrap_server_public(server: str) -> bool:
     )
 
 
+def _player_page_referer(player_url: str) -> str | None:
+    parsed = urlparse(player_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.netloc:
+        return None
+    dlstreams_hosts = ("dlstreams.com", ".dlstreams.com", "dlstreams.top", ".dlstreams.top")
+    if not any(_host_matches(parsed.hostname, host) for host in dlstreams_hosts):
+        return None
+
+    match = re.search(r"stream-(\d+)\.php", parsed.path)
+    if not match:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/watch.php?id={match.group(1)}"
+
+
 def _resolve_bootstrap_inputs(inputs: BootstrapInputs, *, timeout: int = 10) -> tuple[list[str], str | None, int]:
     last_reason = "status_probe_failed"
     servers = tuple(server for server in inputs.servers if _bootstrap_server_public(server))
@@ -428,12 +442,16 @@ def _static_iframe_urls(html: str, base_url: str) -> list[str]:
 def _http_resolve_player_page(label: str, player_url: str) -> tuple[list[tuple[str, str]], list[str], str | None]:
     try:
         with build_session() as session:
+            headers = dict(DEFAULT_HEADERS)
+            referer = _player_page_referer(player_url)
+            if referer:
+                headers["Referer"] = referer
             response = guarded_get(
                 session,
                 player_url,
                 operation="resolver_http_fallback",
                 timeout=settings.HTTP_TIMEOUT_SECONDS,
-                headers=DEFAULT_HEADERS,
+                headers=headers,
             )
             response.raise_for_status()
             html = response.text
@@ -999,7 +1017,16 @@ class PlaywrightResolver:
                 page.on("framenavigated", on_frame_navigated)
 
                 try:
-                    page.goto(player_url, timeout=settings.PLAYWRIGHT_TIMEOUT_MS, wait_until="domcontentloaded")
+                    goto_kwargs: dict[str, Any] = {}
+                    referer = _player_page_referer(player_url)
+                    if referer:
+                        goto_kwargs["referer"] = referer
+                    page.goto(
+                        player_url,
+                        timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
+                        wait_until="domcontentloaded",
+                        **goto_kwargs,
+                    )
                     result.player_final_url = page.url
                 except PWTimeout:
                     result.error = f"timeout while loading {player_url}"

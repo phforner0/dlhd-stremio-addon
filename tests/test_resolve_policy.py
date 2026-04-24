@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 from app import settings
-from app.resolve.player import _extract_embed_proxy_manifest_from_url, _http_resolve_player_page, _new_wait_state, _scan_text, _should_ignore_https_errors, _wait_for_resolution_window
+from app.resolve.player import (
+    _extract_embed_proxy_manifest_from_url,
+    _http_resolve_player_page,
+    _new_wait_state,
+    _player_page_referer,
+    _scan_text,
+    _should_ignore_https_errors,
+    _wait_for_resolution_window,
+)
 
 
 class _FakeResponse:
@@ -129,6 +137,16 @@ def test_extract_embed_proxy_manifest_from_url_rejects_private_hosts(monkeypatch
     assert manifests == []
 
 
+def test_player_page_referer_is_derived_for_dlstreams_players() -> None:
+    assert _player_page_referer("https://dlstreams.com/stream/stream-81.php") == "https://dlstreams.com/watch.php?id=81"
+    assert (
+        _player_page_referer("https://dlstreams.com/watch/stream-81.php")
+        == "https://dlstreams.com/watch.php?id=81"
+    )
+    assert _player_page_referer("https://example.test/stream/stream-81.php") is None
+    assert _player_page_referer("https://dlstreams.com/stream/not-a-channel.php") is None
+
+
 def test_wait_for_resolution_window_does_not_exit_early_for_frame_only_signal(monkeypatch) -> None:
     now = [0.0]
     monkeypatch.setattr("app.resolve.player.time.monotonic", lambda: now[0])
@@ -142,6 +160,7 @@ def test_wait_for_resolution_window_does_not_exit_early_for_frame_only_signal(mo
 
 def test_http_resolve_player_page_extracts_static_iframe_bootstrap(monkeypatch) -> None:
     html = '<html><body><iframe src="https://domaintransver.cfd/premiumtv/daddyhd.php?id=81"></iframe></body></html>'
+    captured_headers = {}
 
     class FakeSession:
         def __enter__(self):
@@ -151,9 +170,14 @@ def test_http_resolve_player_page_extracts_static_iframe_bootstrap(monkeypatch) 
             return None
 
     monkeypatch.setattr("app.resolve.player.build_session", lambda: FakeSession())
+
+    def fake_guarded_get(session, url, operation, timeout, headers):
+        captured_headers.update(headers)
+        return _FakeHttpResponse(url, html)
+
     monkeypatch.setattr(
         "app.resolve.player.guarded_get",
-        lambda session, url, operation, timeout, headers: _FakeHttpResponse(url, html),
+        fake_guarded_get,
     )
     monkeypatch.setattr(
         "app.resolve.player._extract_embed_proxy_manifest_from_url",
@@ -165,6 +189,7 @@ def test_http_resolve_player_page_extracts_static_iframe_bootstrap(monkeypatch) 
     assert iframe_urls == ["https://domaintransver.cfd/premiumtv/daddyhd.php?id=81"]
     assert hits == [("https://example.test/proxy/premium81/mono.css", "https://dlstreams.com/stream/stream-81.php")]
     assert final_url == "https://dlstreams.com/stream/stream-81.php"
+    assert captured_headers["Referer"] == "https://dlstreams.com/watch.php?id=81"
 
 
 def test_scan_text_accepts_escaped_and_protocol_relative_manifests() -> None:
